@@ -104,7 +104,7 @@ func NATDiscover(
 			defer discoveryWaitGroup.Done()
 
 			portMappingTypes, portMapperProbe, err := discoverPortMappingTypes(
-				discoverCtx, config.Logger)
+				discoverCtx, config.Logger, config.WebRTCDialCoordinator)
 
 			if err == nil {
 				// Deliver the results. The WebRTCDialCoordinator provider
@@ -246,7 +246,7 @@ func discoverNATType(
 
 		config.WebRTCDialCoordinator.STUNServerAddressFailed(RFC5780, stunServerAddress)
 
-		return NATTypeUnknown, errors.Trace(err)
+		return NATTypeUnknown, errors.Trace(r.err)
 	}
 
 	config.WebRTCDialCoordinator.STUNServerAddressSucceeded(RFC5780, stunServerAddress)
@@ -256,9 +256,10 @@ func discoverNATType(
 
 func discoverPortMappingTypes(
 	ctx context.Context,
-	logger common.Logger) (PortMappingTypes, *PortMappingProbe, error) {
+	logger common.Logger,
+	coordinator WebRTCDialCoordinator) (PortMappingTypes, *PortMappingProbe, error) {
 
-	portMappingTypes, portMapperProbe, err := probePortMapping(ctx, logger)
+	portMappingTypes, portMapperProbe, err := probePortMapping(ctx, logger, coordinator)
 	if err != nil {
 		return nil, nil, errors.Trace(err)
 	}

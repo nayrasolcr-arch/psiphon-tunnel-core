@@ -20,6 +20,7 @@
 package common
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,10 +28,30 @@ import (
 	"time"
 )
 
+// profileManifestName is the completion marker WriteRuntimeProfiles writes
+// last, atomically, into the output directory: a collector watching the
+// directory (a host agent that ships the profiles elsewhere) takes a
+// manifest newer than its trigger as "the collection is complete" and its
+// files list as exactly what to ship, instead of guessing from timestamps.
+const profileManifestName = "manifest.json"
+
+// profileManifest is the manifest's content: when the collection completed
+// and the base names of the profile files it wrote.
+type profileManifest struct {
+	CompletedAt time.Time `json:"completed_at"`
+	Files       []string  `json:"files"`
+}
+
 // WriteRuntimeProfiles writes Go runtime profile information to a set of
-// files in the specified output directory. The profiles include "heap",
-// "goroutine", and other selected profiles from:
-// https://golang.org/pkg/runtime/pprof/#Profile.
+// files in the specified output directory, creating the directory when it
+// does not exist. The profiles include "heap", "goroutine", and other
+// selected profiles from: https://golang.org/pkg/runtime/pprof/#Profile.
+//
+// The profiles are written in pprof's legacy text format, with comments
+// translating addresses to function names, so that a programmer can read
+// them without tools; the CPU profile, which has no text form, is always
+// the gzip-compressed protocol buffer. See WriteRuntimeProfilesProtobuf for
+// the form tools read.
 //
 // The SampleDurationSeconds inputs determine how long to wait and sample
 // profiles that require active sampling. When set to 0, these profiles are
@@ -41,6 +62,51 @@ func WriteRuntimeProfiles(
 	filenameSuffix string,
 	blockSampleDurationSeconds int,
 	cpuSampleDurationSeconds int) {
+
+	writeRuntimeProfiles(
+		logger, outputDirectory, filenameSuffix,
+		blockSampleDurationSeconds, cpuSampleDurationSeconds, 1)
+}
+
+// WriteRuntimeProfilesProtobuf is WriteRuntimeProfiles with every profile
+// written in the gzip-compressed protocol buffer format, the function
+// names, files and lines embedded, so that pprof tooling can read the
+// profiles without the binary that produced them. The legacy text format
+// keeps its symbols in comments, which tools discard.
+func WriteRuntimeProfilesProtobuf(
+	logger Logger,
+	outputDirectory string,
+	filenameSuffix string,
+	blockSampleDurationSeconds int,
+	cpuSampleDurationSeconds int) {
+
+	writeRuntimeProfiles(
+		logger, outputDirectory, filenameSuffix,
+		blockSampleDurationSeconds, cpuSampleDurationSeconds, 0)
+}
+
+// writeRuntimeProfiles is the shared implementation; debug is the
+// runtime/pprof Profile.WriteTo debug level: 0 for the protocol buffer, 1
+// for the legacy text format.
+func writeRuntimeProfiles(
+	logger Logger,
+	outputDirectory string,
+	filenameSuffix string,
+	blockSampleDurationSeconds int,
+	cpuSampleDurationSeconds int,
+	debug int) {
+
+	if err := os.MkdirAll(outputDirectory, 0755); err != nil {
+		logger.WithTraceFields(
+			LogFields{
+				"error":     err,
+				"directory": outputDirectory}).Error("create profile directory failed")
+		return
+	}
+
+	// written collects the base names of the profile files written in full,
+	// for the manifest.
+	var written []string
 
 	openProfileFile := func(profileName string) *os.File {
 		filename := filepath.Join(outputDirectory, profileName+".profile")
@@ -65,14 +131,16 @@ func WriteRuntimeProfiles(
 		if file == nil {
 			return
 		}
-		err := pprof.Lookup(profileName).WriteTo(file, 1)
+		err := pprof.Lookup(profileName).WriteTo(file, debug)
 		file.Close()
 		if err != nil {
 			logger.WithTraceFields(
 				LogFields{
 					"error":       err,
 					"profileName": profileName}).Error("write profile failed")
+			return
 		}
+		written = append(written, filepath.Base(file.Name()))
 	}
 
 	// TODO: capture https://golang.org/pkg/runtime/debug/#WriteHeapDump?
@@ -100,6 +168,7 @@ func WriteRuntimeProfiles(
 				time.Sleep(time.Duration(cpuSampleDurationSeconds) * time.Second)
 				pprof.StopCPUProfile()
 				logger.WithTrace().Info("end cpu profiling")
+				written = append(written, filepath.Base(file.Name()))
 			}
 			file.Close()
 		}
@@ -119,4 +188,37 @@ func WriteRuntimeProfiles(
 		writeProfile("block")
 		writeProfile("mutex")
 	}
+
+	writeProfileManifest(logger, outputDirectory, written)
+}
+
+// writeProfileManifest writes the completion manifest last and atomically
+// (a temporary file renamed into place), so a collector can never observe
+// a manifest describing a half-finished collection. A collection that wrote
+// no profile gets no manifest: there is nothing to collect, and the write
+// failures were already logged.
+func writeProfileManifest(logger Logger, outputDirectory string, files []string) {
+	if len(files) == 0 {
+		return
+	}
+	content, err := json.Marshal(profileManifest{CompletedAt: time.Now(), Files: files})
+	if err != nil {
+		logger.WithTraceFields(
+			LogFields{"error": err}).Error("marshal profile manifest failed")
+		return
+	}
+	manifest := filepath.Join(outputDirectory, profileManifestName)
+	tmp := manifest + ".tmp"
+	if err := os.WriteFile(tmp, content, 0666); err != nil {
+		logger.WithTraceFields(
+			LogFields{"error": err, "fileName": tmp}).Error("write profile manifest failed")
+		return
+	}
+	if err := os.Rename(tmp, manifest); err != nil {
+		logger.WithTraceFields(
+			LogFields{"error": err, "fileName": manifest}).Error("commit profile manifest failed")
+		return
+	}
+	logger.WithTraceFields(
+		LogFields{"fileName": manifest, "files": len(files)}).Info("wrote profile manifest")
 }

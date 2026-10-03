@@ -111,7 +111,7 @@ func GetTactics(ctx context.Context, config *Config, useStoredTactics bool) (fet
 				return
 			}
 
-			serverEntry, err := iterator.Next(ctx)
+			serverEntry, _, err := iterator.Next(ctx)
 			if err != nil {
 				NoticeWarning("tactics iterator failed: %s", errors.Trace(err))
 				return
@@ -226,7 +226,7 @@ func fetchTactics(
 			serverEntry.GetSupportedTacticsProtocols(), replayProtocol)
 	}
 
-	selectProtocol := func(serverEntry *protocol.ServerEntry, _ string) (string, bool) {
+	selectProtocol := func(serverEntry *protocol.ServerEntry, _ bool, _ string) (string, bool) {
 		tacticsProtocols := serverEntry.GetSupportedTacticsProtocols()
 		if len(tacticsProtocols) == 0 {
 			return "", false
@@ -247,22 +247,22 @@ func fetchTactics(
 		tls.NewLRUClientSessionCache(0),
 		utls.NewLRUClientSessionCache(0),
 		nil,
+		nil,
 		canReplay,
 		selectProtocol,
 		serverEntry,
 		nil,
 		nil,
 		true,
-		0,
 		0)
-	if dialParams == nil && err == nil {
-		err = errors.TraceNew("unexpected nil dialParams")
-	}
 	if err != nil {
 		return nil, errors.Tracef(
 			"failed to make dial parameters for %s: %v",
 			serverEntry.GetDiagnosticID(),
 			errors.Trace(err))
+	}
+	if dialParams == nil {
+		return nil, nil
 	}
 
 	NoticeRequestingTactics(dialParams)

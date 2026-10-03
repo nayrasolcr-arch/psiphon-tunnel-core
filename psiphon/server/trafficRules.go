@@ -176,9 +176,8 @@ type TrafficRulesFilter struct {
 	// match this filter. When omitted or empty, any client city matches.
 	Cities []string
 
-	// APIProtocol specifies whether the client must use the SSH
-	// API protocol (when "ssh") or the web API protocol (when "web").
-	// When omitted or blank, any API protocol matches.
+	// APIProtocol specifies whether the client must use the SSH API protocol
+	// (when "ssh"). When omitted or blank, any API protocol matches.
 	APIProtocol string
 
 	// HandshakeParameters specifies handshake API parameter names and
@@ -186,6 +185,11 @@ type TrafficRulesFilter struct {
 	// filter. Only scalar string API parameters may be filtered.
 	// Values may be patterns containing the '*' wildcard.
 	HandshakeParameters map[string][]string
+
+	// ClientFeatures specifies client feature values, at least one
+	// of which must be present to match this filter. Values are matched
+	// exactly.
+	ClientFeatures []string
 
 	// AuthorizedAccessTypes specifies a list of access types, at least
 	// one of which the client must have presented an active authorization
@@ -219,6 +223,7 @@ type TrafficRulesFilter struct {
 	asnLookup                   common.StringLookup
 	cityLookup                  common.StringLookup
 	activeAuthorizationIDLookup common.StringLookup
+	clientFeatureLookup         common.StringLookup
 	providerIDLookup            common.StringLookup
 }
 
@@ -531,6 +536,7 @@ func (set *TrafficRulesSet) initLookups() {
 		filter.asnLookup = common.NewStringLookup(filter.ASNs)
 		filter.cityLookup = common.NewStringLookup(filter.Cities)
 		filter.activeAuthorizationIDLookup = common.NewStringLookup(filter.ActiveAuthorizationIDs)
+		filter.clientFeatureLookup = common.NewStringLookup(filter.ClientFeatures)
 		filter.providerIDLookup = common.NewStringLookup(filter.ProviderIDs)
 	}
 
@@ -717,6 +723,23 @@ func (set *TrafficRulesSet) GetTrafficRules(
 				if err != nil || !common.ContainsWildcard(values, clientValue) {
 					return false
 				}
+			}
+		}
+
+		if len(filter.ClientFeatures) > 0 {
+			if !state.completed {
+				return false
+			}
+
+			match := false
+			for _, clientFeature := range state.clientFeatures {
+				if filter.clientFeatureLookup.Contains(clientFeature) {
+					match = true
+					break
+				}
+			}
+			if !match {
+				return false
 			}
 		}
 

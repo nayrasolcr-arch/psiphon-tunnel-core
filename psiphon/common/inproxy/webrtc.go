@@ -413,43 +413,44 @@ func newWebRTCConn(
 	// so the client can orchestrate replay on both ends of the connection by
 	// reusing an obfuscation secret. Derive a secret specific to DTLS.
 	//
-	// Each side independently selects its DTLS fingerprint profile. This
-	// intentional asymmetry produces a circumvention-friendly mix of profiles
-	// across the two peers, while determinism and replay are preserved by
-	// seeding both sides' PRNGs from the shared obfuscation secret.
-	//
-	// Implementation uses stock pion/dtls v3 ClientHelloMessageHook and
-	// ServerHelloMessageHook on the SettingEngine.
+	// Each side selects its DTLS fingerprint profile deterministically from
+	// ClientRootObfuscationSecret using distinct offer and answer salts. This
+	// produces a circumvention-friendly mix of profiles across the two peers,
+	// while determinism and replay are preserved by seeding both sides' PRNGs
+	// from the shared obfuscation secret.
 
 	if config.DTLSFingerprint != "" {
-
-		dtlsObfuscationSecret, err := deriveObfuscationSecret(
-			config.ClientRootObfuscationSecret, "in-proxy-DTLS-seed")
-		if err != nil {
-			return nil, nil, nil, errors.Trace(err)
-		}
-
-		baseSeed := prng.Seed(dtlsObfuscationSecret)
 
 		// Derive distinct sub-seeds for client hello and server hello,
 		// and for the offer vs answer side so each peer's randomization
 		// is distinct.
-		clientHelloSaltSuffix := "-client-hello-offer"
+
+		dtlsClientHelloContext := "in-proxy-DTLS-randomization-client-hello-offer"
+		dtlsServerHelloContext := "in-proxy-DTLS-randomization-server-hello-offer"
 		if !isOffer {
-			clientHelloSaltSuffix = "-client-hello-answer"
-		}
-		clientHelloSeed, err := prng.NewSaltedSeed(
-			&baseSeed, "in-proxy-DTLS"+clientHelloSaltSuffix)
-		if err != nil {
-			return nil, nil, nil, errors.Trace(err)
-		}
-		serverHelloSeed, err := prng.NewSaltedSeed(
-			&baseSeed, "in-proxy-DTLS-server-hello")
-		if err != nil {
-			return nil, nil, nil, errors.Trace(err)
+			dtlsClientHelloContext = "in-proxy-DTLS-randomization-client-hello-answer"
+			dtlsServerHelloContext = "in-proxy-DTLS-randomization-server-hello-answer"
 		}
 
-		setDTLSHooks(&settingEngine, config.DTLSFingerprint, clientHelloSeed, serverHelloSeed)
+		dtlsClientHelloObfuscationSecret, err := deriveObfuscationSecret(
+			config.ClientRootObfuscationSecret, dtlsClientHelloContext)
+		if err != nil {
+			return nil, nil, nil, errors.Trace(err)
+		}
+		clientHelloSeed := prng.Seed(dtlsClientHelloObfuscationSecret)
+
+		dtlsServerHelloObfuscationSecret, err := deriveObfuscationSecret(
+			config.ClientRootObfuscationSecret, dtlsServerHelloContext)
+		if err != nil {
+			return nil, nil, nil, errors.Trace(err)
+		}
+		serverHelloSeed := prng.Seed(dtlsServerHelloObfuscationSecret)
+
+		setDTLSHooks(
+			&settingEngine,
+			config.DTLSFingerprint,
+			&clientHelloSeed,
+			&serverHelloSeed)
 	}
 
 	// Configure traffic shaping, which adds random padding and decoy messages
@@ -778,6 +779,8 @@ func newWebRTCConn(
 		//   Limitation: in states of low tunnel traffic, the video frame and
 		//   timestamp progression won't look realistic.
 		//
+		// - Marker is set on the final packet of each video frame.
+		//
 		// - PayloadType is the codec and is auto-populated by pion.
 		//
 		// - SequenceNumber is a packet sequence number and populated by
@@ -1007,7 +1010,7 @@ func newWebRTCConn(
 			// Limitation: if there are multiple responding protocol types, it's
 			// not known here which was used for this dial.
 			config.WebRTCDialCoordinator.SetPortMappingTypes(
-				getRespondingPortMappingTypes(config.WebRTCDialCoordinator.NetworkID()))
+				portMapper.respondingPortMappingTypes())
 
 		}
 	}
@@ -1410,6 +1413,10 @@ func (conn *webRTCConn) IsClosed() bool {
 
 func (conn *webRTCConn) Read(p []byte) (int, error) {
 
+	if len(p) == 0 {
+		return 0, nil
+	}
+
 	if !conn.config.UseMediaStreams {
 		// Data channel mode.
 		n, err := conn.readDataChannel(p)
@@ -1770,9 +1777,10 @@ func (conn *webRTCConn) readDataChannelMessage(p []byte) (int, error) {
 
 				conn.readOffset += n + int(paddingSize)
 
-				atomic.AddInt32(&conn.paddedMessagesReceived, 1)
 				if conn.readOffset == conn.readLength {
 					atomic.AddInt32(&conn.decoyMessagesReceived, 1)
+				} else if paddingSize > 0 {
+					atomic.AddInt32(&conn.paddedMessagesReceived, 1)
 				}
 			}
 		}
@@ -1917,13 +1925,33 @@ func (conn *webRTCConn) writeDataChannelMessage(p []byte, decoy bool) (int, erro
 
 	} else if !conn.trafficShapingDone {
 
-		// Padding normal messages is done and all decoy messages are sent, so
-		// send a special padding header with padding size -1, signaling the
-		// peer that no additional padding will be performed and no
-		// subsequent messages will contain a padding header.
-
 		doPadding = true
-		paddingSize = -1
+
+		if conn.config.ReliableTransport {
+
+			// Reliable data channels deliver messages in order, so send a
+			// special padding header with padding size -1, signaling that no
+			// subsequent messages will contain a padding header.
+
+			paddingSize = -1
+
+		} else {
+
+			// Limitation: in this mode, the padding header is always sent.
+			// Unreliable data channel messages may be lost or delivered out
+			// of order. Continue sending a zero padding header, since a -1
+			// header could otherwise be lost or delivered after a subsequent
+			// unpadded message. Since trafficShapingDone is never set in
+			// this mode, the allocation and copy overhead associated with
+			// trafficShapingBuffer is permanent.
+			//
+			// Potential future enhancement: in a new negotiated protocol
+			// version, use SCTP PPIDs to distinguish padded binary messages
+			// from unpadded string messages. This would eliminate the ongoing
+			// one byte padding header without relying on message ordering.
+
+			paddingSize = 0
+		}
 
 	}
 
@@ -1950,6 +1978,10 @@ func (conn *webRTCConn) writeDataChannelMessage(p []byte, decoy bool) (int, erro
 		paddingHeaderSize = binary.PutVarint(paddingHeader[:], int64(paddingSize))
 		writeSize += paddingHeaderSize
 	}
+
+	// Limitation: when a padding header is attached a write of len(p) exactly
+	// dataChannelMaxMessageSize fails this check. In practice, writes don't
+	// exceed 32K (io.Copy) or 65507 (maximum UDP payload) bytes.
 
 	if writeSize > dataChannelMaxMessageSize {
 		return 0, errors.TraceNew("write too large")
@@ -2195,13 +2227,16 @@ func (conn *webRTCConn) writeMediaTrackPacket(p []byte, decoy bool) (int, error)
 
 	// Determine padding size and padding header size.
 
-	// Limitation: unlike data channel padding, the header size is fixed, not
-	// a varint, and is always sent. This is due to the fixed QUIC max packet
-	// size adjustment. To limit the overhead, and because the maximum SRTP
-	// payload size is much smaller than the maximum data channel message
-	// size, the padding is limited to 254 bytes, represented with a 1 byte
-	// header. The value 255 is reserved to signal that the entire packet is
-	// a decoy packet.
+	// Limitation: unlike the data channel in reliable transport mode, the
+	// padding header is always sent. Media stream packets may be lost or
+	// reordered, so each packet is framed independently and always includes
+	// a padding header. Unlike data channel padding, the header size is
+	// fixed, not a varint. The fixed QUIC max packet size adjustment
+	// accounts for this always-present byte. To limit the overhead, and
+	// because the maximum SRTP payload size is much smaller than the maximum
+	// data channel message size, the padding is limited to 254 bytes,
+	// represented with a 1 byte header. The value 255 is reserved to signal
+	// that the entire packet is a decoy packet.
 
 	conn.trafficShapingBuffer.Reset()
 
@@ -2289,11 +2324,13 @@ func (conn *webRTCConn) writeMediaTrackPacket(p []byte, decoy bool) (int, error)
 	// Send the RTP packet.
 
 	// Dynamic plaintext RTP header values are set here: the sequence number
-	// is set when sending the packet; the timestamp, initialized in
+	// is set when sending the packet; Marker is set if this packet completes
+	// the current video frame; the timestamp, initialized in
 	// newWebRTCConn, is updated once payload equivalent to a complete
 	// video "frame" has been sent. See the "Plaintext RTP header fields"
 	// comment in newWebRTCConn.
 
+	conn.sendMediaTrackPacket.Marker = len(paddedPayload) >= conn.sendMediaTrackRemainingFrameSize
 	conn.sendMediaTrackPacket.SequenceNumber = conn.sendMediaTrackSequencer.NextSequenceNumber()
 	conn.sendMediaTrackPacket.Payload = paddedPayload
 	err := sendMediaTrack.WriteRTP(conn.sendMediaTrackPacket)
@@ -2786,6 +2823,8 @@ func filterSDPAddresses(
 type webRTCSDPMetrics struct {
 	iceCandidateCount      int
 	iceCandidateTypes      []ICECandidateType
+	iceRegion              string
+	iceASN                 string
 	hasIPv4                bool
 	hasIPv6                bool
 	hasPrivateIP           bool
@@ -2859,6 +2898,9 @@ func processSDPAddresses(
 	hasPrivateIP := false
 	filteredCandidateReasons := make(map[string]int)
 	allowedGeoIPMismatches := 0
+	iceRegion := ""
+	iceASN := ""
+	recordedICEGeoIP := false
 
 	var portMappingICECandidates []sdp.Attribute
 	if portMappingExternalAddr != "" {
@@ -3042,6 +3084,21 @@ func processSDPAddresses(
 
 						if allowGeoIPMismatchCandidates {
 							allowedGeoIPMismatches += 1
+
+							// Record the first non-private, mismatching ICE
+							// candidate's GeoIP. Matching candidates are
+							// skipped because they duplicate the peer's
+							// broker-observed region.
+							//
+							// Limitation: in some circumstances, an SDP may
+							// contain multiple non-private, mismatching
+							// candidates with distinct GeoIP regions/ASNs;
+							// only the first is recorded.
+							if !recordedICEGeoIP && !candidateIsPrivateIP {
+								iceRegion = candidateGeoIPData.Country
+								iceASN = candidateGeoIPData.ASN
+								recordedICEGeoIP = true
+							}
 						} else {
 							version := "IPv4"
 							if candidateIsIPv6 {
@@ -3101,6 +3158,8 @@ func processSDPAddresses(
 
 	metrics := &webRTCSDPMetrics{
 		iceCandidateCount:      candidateCount,
+		iceRegion:              iceRegion,
+		iceASN:                 iceASN,
 		hasIPv4:                hasIPv4,
 		hasIPv6:                hasIPv6,
 		hasPrivateIP:           hasPrivateIP,

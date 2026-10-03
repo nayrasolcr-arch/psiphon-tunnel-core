@@ -69,6 +69,9 @@ typedef NS_ENUM(NSInteger, PsiphonConnectionState)
  and retrieve config info from it.
 
  All delegate methods will be called on a single serial dispatch queue. They will be made asynchronously unless otherwise noted (specifically when calling getPsiphonConfig and getEmbeddedServerEntries).
+
+ Asynchronous delivery does not make library calls from callbacks safe. Observe
+ the callback restrictions documented on individual methods below.
  */
 @protocol TunneledAppDelegate <NSObject, PsiphonTunnelLoggerDelegate>
 
@@ -215,6 +218,20 @@ WWAN or vice versa or VPN state changed
  @param port  The port number.
  */
 - (void)onListeningHttpProxyPort:(NSInteger)port;
+/*!
+ Called when tunnel-core is listening for the local SOCKS proxy on a Unix
+ domain socket. Emitted instead of onListeningSocksProxyPort when
+ UseUnixDomainSockets is enabled.
+ @param path  The Unix domain socket path.
+ */
+- (void)onListeningSocksProxyUnixPath:(NSString * _Nonnull)path;
+/*!
+ Called when tunnel-core is listening for the local HTTP proxy on a Unix
+ domain socket. Emitted instead of onListeningHttpProxyPort when
+ UseUnixDomainSockets is enabled.
+ @param path  The Unix domain socket path.
+ */
+- (void)onListeningHttpProxyUnixPath:(NSString * _Nonnull)path;
 
 /*!
  Called when a error occurs when trying to utilize a configured upstream proxy.
@@ -336,6 +353,16 @@ followed by a tunnel-core shutdown.
  */
 - (void)onLightProxyAvailable;
 
+/*!
+ Called asynchronously on the library's serial callback queue with a persisted opaque access
+ token at startup, if available, and whenever a changed token has been persisted.
+ Requires EnableDSLAccessTokenRegistration in the config.
+ The token may be used for push notifications; it is not an FCM or APNs device token.
+ Dispatch calls to PsiphonTunnel APIs onto a separate queue.
+ @param token The access token as unpadded Base64URL text.
+ */
+- (void)onAccessToken:(NSString * _Nonnull)token;
+
 @end
 
 /*!
@@ -389,12 +416,16 @@ Returns the path where the rotated notices file will be created.
  Start connecting the PsiphonTunnel. Returns before connection is complete -- delegate callbacks (such as `onConnected` and `onConnectionStateChanged`) are used to indicate progress and state.
  @param ifNeeded  If TRUE, the tunnel will only be started if it's not already connected and healthy. If FALSE, the tunnel will be forced to stop and reconnect.
  @return TRUE if the connection start was successful, FALSE otherwise.
+
+ @warning Direct calls from a TunneledAppDelegate callback is unsupported as this can deadlock.
  */
 - (BOOL)start:(BOOL)ifNeeded;
 
 /*!
  Reconnect a previously started PsiphonTunnel with the specified config changes.
  reconnectWithConfig has no effect if there is no running PsiphonTunnel.
+
+ @warning Direct calls from a TunneledAppDelegate callback is unsupported as this can deadlock.
  */
 - (void)reconnectWithConfig:(NSString * _Nullable) newSponsorID :(NSArray<NSString *> *_Nullable)newAuthorizations;
 
@@ -406,18 +437,31 @@ Returns the path where the rotated notices file will be created.
  session ID.
 
  @return TRUE if the connection start was successful, FALSE otherwise.
+
+ @warning Direct calls from a TunneledAppDelegate callback is unsupported as this can deadlock.
  */
 - (BOOL)stopAndReconnectWithCurrentSessionID;
 
 /*!
- Notify Psiphon that the host app has resumed from background.
- */
-- (void)appResumed;
-
-/*!
  Stop the tunnel (regardless of its current connection state).
+
+ @warning Direct calls from a TunneledAppDelegate callback is unsupported as this can deadlock.
  */
 - (void)stop;
+
+/*!
+ Toggle packet tunnel mode traffic dropping.
+
+ @warning Direct calls from a TunneledAppDelegate callback is unsupported as this can deadlock.
+ */
+- (void)dropPacketTunnelTraffic:(BOOL)drop;
+
+/*!
+ Notify Psiphon that the host app has resumed from background.
+
+ @warning Direct calls from a TunneledAppDelegate callback is unsupported as this can deadlock.
+ */
+- (void)appResumed;
 
 /*!
  Returns the current tunnel connection state.
@@ -460,8 +504,30 @@ Returns the path where the rotated notices file will be created.
  Returns true if the import succeeded and false on any error. Error
  details are logged to diagnostics. If an import is partially
  successful, the imported server entries are retained and prioritized.
+
+ @warning Direct calls from a TunneledAppDelegate callback is unsupported as this can deadlock.
  */
 - (BOOL)importPushPayload:(NSData * _Nonnull)payload;
+
+/*!
+ Returns the persisted opaque access token. The token may be used for push
+ notifications; it is not an FCM or APNs device token. Returns an empty string
+ when Psiphon is not running, no token has been registered, or retrieval fails;
+ retrieval errors are logged to diagnostics.
+
+ @warning Direct calls from a TunneledAppDelegate callback is unsupported as this can deadlock.
+ */
+- (NSString * _Nonnull)getAccessToken;
+
+/*!
+ Record client event attributed to the current tunnel or light proxy.
+ Attribution follows the type used by the most recent successful application
+ port forward dial. Call recordClientEvent as soon as practical after the
+ event occurs.
+
+ @warning Direct calls from a TunneledAppDelegate callback is unsupported as this can deadlock.
+ */
+- (void)recordClientEvent:(NSString * _Nonnull)event;
 
 /*!
  Provides the tunnel-core build info json as a string. See the tunnel-core build info code for details https://github.com/Psiphon-Labs/psiphon-tunnel-core/blob/master/psiphon/common/buildinfo.go.
@@ -469,12 +535,29 @@ Returns the path where the rotated notices file will be created.
  */
 + (NSString * _Nonnull)getBuildInfo;
 
+/*!
+ Returns the uppercase region identifier that the device is probably located in. This is the same
+ best-effort approximation that the Psiphon library reports as the DeviceRegion metric.
+
+ On iOS and Mac Catalyst 16 and later, the Contacts country code is preferred. On earlier versions,
+ the carrier country code is preferred. The system time zone and current locale are then used as
+ fallbacks. Native macOS starts with the system time zone because carrier information is not
+ available. If no source yields a region, an empty string is returned.
+
+ @note This is an approximation, not authoritative geolocation, and the returned identifier is not
+ guaranteed to be a two-letter ISO 3166-1 country code.
+ @return An uppercase region identifier, or an empty string if none can be determined.
+ */
++ (NSString * _Nonnull)getDeviceRegion;
+
 #pragma mark - Profiling utitlities
 
 /*!
  Writes Go runtime profile information to a set of files in the specifiec output directory.
  @param cpuSampleDurationSeconds determines how to long to wait and sample profiles that require active sampling. When set to 0, these profiles are skipped.
  @param blockSampleDurationSeconds determines how to long to wait and sample profiles that require active sampling. When set to 0, these profiles are skipped.
+
+ @warning Direct calls from a TunneledAppDelegate callback is unsupported as this can deadlock.
  */
 - (void)writeRuntimeProfilesTo:(NSString * _Nonnull)outputDirectory withCPUSampleDurationSeconds:(int)cpuSampleDurationSeconds withBlockSampleDurationSeconds:(int)blockSampleDurationSeconds;
 

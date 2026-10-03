@@ -22,7 +22,6 @@ package psiphon
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	std_errors "errors"
 	"fmt"
 	"io"
@@ -43,7 +42,6 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/resolver"
 	utls "github.com/Psiphon-Labs/utls"
-	"github.com/cespare/xxhash"
 )
 
 // InproxyBrokerClientManager manages an InproxyBrokerClientInstance, an
@@ -501,8 +499,15 @@ func NewInproxyBrokerClientInstance(
 				func(spec *parameters.InproxyBrokerSpec, dialParams *InproxyBrokerDialParameters) bool {
 					// Replay the successful broker spec, if present, by
 					// comparing its hash with that of the candidate.
-					return dialParams.LastUsedTimestamp.After(now.Add(-ttl)) &&
-						bytes.Equal(dialParams.LastUsedBrokerSpecHash, hashBrokerSpec(spec))
+					if !dialParams.LastUsedTimestamp.After(now.Add(-ttl)) {
+						return false
+					}
+					brokerSpecHash, err := spec.Hash()
+					if err != nil {
+						NoticeWarning("InproxyBrokerSpec.Hash failed: %v", errors.Trace(err))
+						return false
+					}
+					return bytes.Equal(dialParams.LastUsedBrokerSpecHash, brokerSpecHash)
 				})
 		if err != nil {
 			NoticeWarning("SelectCandidateWithNetworkReplayParameters failed: %v", errors.Trace(err))
@@ -1207,18 +1212,19 @@ func MakeInproxyBrokerDialParameters(
 	brokerSpec *parameters.InproxyBrokerSpec,
 	tlsCache utls.ClientSessionCache) (*InproxyBrokerDialParameters, error) {
 
-	if config.UseUpstreamProxy() {
-		return nil, errors.TraceNew("upstream proxy unsupported")
-	}
-
 	currentTimestamp := time.Now()
 
 	// Select new broker dial parameters
 
+	brokerSpecHash, err := brokerSpec.Hash()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
 	brokerDialParams := &InproxyBrokerDialParameters{
 		brokerSpec:             brokerSpec,
 		LastUsedTimestamp:      currentTimestamp,
-		LastUsedBrokerSpecHash: hashBrokerSpec(brokerSpec),
+		LastUsedBrokerSpecHash: brokerSpecHash,
 	}
 
 	// FrontedMeekDialParameters
@@ -1226,11 +1232,15 @@ func MakeInproxyBrokerDialParameters(
 	// The broker round trips use MeekModeWrappedPlaintextRoundTrip without
 	// meek cookies, so meek obfuscation is not configured. The in-proxy
 	// broker session payloads have their own obfuscation layer.
+	//
+	// makeFrontedMeekDialParameters may wire up upstream proxy support, which
+	// is compatible with the current broker transports. While in-proxy
+	// tunnel protocols are incompatible with UpstreamProxyURL, other broker
+	// use cases, such as relayed DSL requests, will still work.
 
 	payloadSecure := true
 	skipVerify := false
 
-	var err error
 	brokerDialParams.FrontedHTTPDialParameters, err = makeFrontedMeekDialParameters(
 		config,
 		p,
@@ -1337,16 +1347,6 @@ func (brokerDialParams *InproxyBrokerDialParameters) GetMetrics() common.LogFiel
 	// Requires a reference to the InproxyBrokerRoundTripper.
 
 	return logFields
-}
-
-// hashBrokerSpec hashes the broker spec. The hash is used to detect when
-// broker spec tactics have changed.
-func hashBrokerSpec(spec *parameters.InproxyBrokerSpec) []byte {
-	var hash [8]byte
-	binary.BigEndian.PutUint64(
-		hash[:],
-		uint64(xxhash.Sum64String(fmt.Sprintf("%+v", spec))))
-	return hash[:]
 }
 
 // InproxyBrokerRoundTripper is a broker request round trip transport
@@ -1661,9 +1661,11 @@ func NewInproxyWebRTCDialInstance(
 	}
 
 	if isProxy && webRTCDialParameters == nil {
-		// Auto-generate STUN dial parameters. There's no replay in this case.
+		// Auto-generate WebRTC dial parameters. There's no replay in this
+		// case. The proxy DTLS fingerprint is selected later, after the
+		// client root obfuscation secret is received from the broker.
 		var err error
-		webRTCDialParameters, err = MakeInproxyWebRTCDialParameters(p)
+		webRTCDialParameters, err = MakeInproxyWebRTCDialParameters(p, true)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -1759,8 +1761,24 @@ func (w *InproxyWebRTCDialInstance) ClientRootObfuscationSecret() inproxy.Obfusc
 }
 
 // Implements the inproxy.WebRTCDialCoordinator interface.
-func (w *InproxyWebRTCDialInstance) DTLSFingerprint() string {
+func (w *InproxyWebRTCDialInstance) ClientDTLSFingerprint() string {
 	return w.webRTCDialParameters.DTLSFingerprint
+}
+
+// Implements the inproxy.WebRTCDialCoordinator interface.
+func (w *InproxyWebRTCDialInstance) ProxyDTLSFingerprint(
+	clientRootObfuscationSecret inproxy.ObfuscationSecret) (string, error) {
+
+	p := w.config.GetParameters().Get()
+	defer p.Close()
+
+	isOffer := false
+	dtlsFingerprint, err := selectDTLSFingerprint(
+		p, clientRootObfuscationSecret, isOffer)
+	if err != nil {
+		return "", errors.Trace(err)
+	}
+	return dtlsFingerprint, nil
 }
 
 // Implements the inproxy.WebRTCDialCoordinator interface.
@@ -2007,6 +2025,18 @@ func (w *InproxyWebRTCDialInstance) BindToDevice(fileDescriptor int) error {
 
 	_, err := deviceBinder.BindToDevice(fileDescriptor)
 	return errors.Trace(err)
+}
+
+// Implements the inproxy.WebRTCDialCoordinator interface.
+func (w *InproxyWebRTCDialInstance) BindToDeviceInterfaceName() string {
+
+	// In a split-interface in-proxy proxy, BindToDevice (via
+	// splitDeviceBinder) binds port mapping sockets to the downstream
+	// (non-upstream) interface; return that interface's name so port mapping
+	// gateway discovery targets the downstream gateway rather than the system
+	// default route. Returns "" outside split-interface mode, selecting
+	// default-route gateway discovery.
+	return w.config.splitInterfaceDownstreamInterfaceName()
 }
 
 func (w *InproxyWebRTCDialInstance) ProxyUpstreamDial(
@@ -2278,7 +2308,8 @@ type InproxyWebRTCDialParameters struct {
 
 // MakeInproxyWebRTCDialParameters generates new InproxyWebRTCDialParameters.
 func MakeInproxyWebRTCDialParameters(
-	p parameters.ParametersAccessor) (*InproxyWebRTCDialParameters, error) {
+	p parameters.ParametersAccessor,
+	isProxy bool) (*InproxyWebRTCDialParameters, error) {
 
 	rootObfuscationSecret, err := inproxy.GenerateRootObfuscationSecret()
 	if err != nil {
@@ -2308,7 +2339,18 @@ func MakeInproxyWebRTCDialParameters(
 		}
 	}
 
-	dtlsFingerprint := selectDTLSFingerprint(p)
+	// Clients select a DTLS fingerprint now. Proxies select later, once they
+	// receive the ClientRootObfuscationSecret.
+
+	var dtlsFingerprint string
+	if !isProxy {
+		isOffer := true
+		dtlsFingerprint, err = selectDTLSFingerprint(
+			p, rootObfuscationSecret, isOffer)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+	}
 
 	return &InproxyWebRTCDialParameters{
 		RootObfuscationSecret:    rootObfuscationSecret,
@@ -2323,20 +2365,33 @@ func MakeInproxyWebRTCDialParameters(
 // with probability InproxyDTLSFingerprintSelectRandomizedProbability, and
 // parrot (mimicry) fingerprints are selected otherwise.
 //
-// Both the client and proxy call selectDTLSFingerprint independently; the
-// proxy is not told which fingerprint the client chose.
+// Clients and proxies select their replayable DTLS fingerprints
+// deterministically from the same client root obfuscation secret, using
+// distinct offer and answer contexts.
 //
-// Limitation: the proxy independently selects its own DTLS fingerprint using
-// its local protocol.SupportedDTLSFingerprints. If a client replays the same
-// ClientRootObfuscationSecret against a different proxy whose
-// SupportedDTLSFingerprints list has been upgraded, downgraded, or
+// Limitation: the proxy selects its DTLS fingerprint using its local
+// protocol.SupportedDTLSFingerprints and tactics parameters. If a client
+// replays the same ClientRootObfuscationSecret against a different proxy
+// whose SupportedDTLSFingerprints list has been upgraded, downgraded, or
 // reordered, the proxy's fingerprint choice will not be the same as on the
-// original dial, even though the PRNG seed is identical. The client-side
-// fingerprint selection and handshake remain reproducible; only the proxy
-// side diverges.
-func selectDTLSFingerprint(p parameters.ParametersAccessor) string {
+// original dial, even though the PRNG seed is identical. Similarly, for
+// randomized fingerprints, the randomized ClientHello content is derived from
+// pion/dtls' default cipher suite and signature algorithm sets, so upgrading
+// pion/dtls also changes that content for a given seed.
+func selectDTLSFingerprint(
+	p parameters.ParametersAccessor,
+	clientRootObfuscationSecret inproxy.ObfuscationSecret,
+	isOffer bool) (string, error) {
 
-	limitFingerprints := p.DTLSFingerprints(parameters.InproxyLimitDTLSFingerprints)
+	PRNG, err := inproxy.DeriveDTLSFingerprintPRNG(
+		clientRootObfuscationSecret, isOffer)
+	if err != nil {
+		return "", errors.Trace(err)
+	}
+
+	limitFingerprints := p.DTLSFingerprintsWithPRNG(
+		parameters.InproxyLimitDTLSFingerprints,
+		PRNG)
 
 	randomizedFingerprints := make([]string, 0)
 	parrotFingerprints := make([]string, 0)
@@ -2354,14 +2409,16 @@ func selectDTLSFingerprint(p parameters.ParametersAccessor) string {
 
 	if len(randomizedFingerprints) > 0 &&
 		(len(parrotFingerprints) == 0 ||
-			p.WeightedCoinFlip(parameters.InproxyDTLSFingerprintSelectRandomizedProbability)) {
-		return randomizedFingerprints[prng.Intn(len(randomizedFingerprints))]
+			PRNG.FlipWeightedCoin(
+				p.Float(parameters.InproxyDTLSFingerprintSelectRandomizedProbability))) {
+		return randomizedFingerprints[PRNG.Intn(len(randomizedFingerprints))], nil
 	}
 
 	if len(parrotFingerprints) == 0 {
-		return ""
+		return "", nil
 	}
-	return parrotFingerprints[prng.Intn(len(parrotFingerprints))]
+
+	return parrotFingerprints[PRNG.Intn(len(parrotFingerprints))], nil
 }
 
 // GetMetrics implements the common.MetricsSource interface.
@@ -2375,7 +2432,9 @@ func (dialParams *InproxyWebRTCDialParameters) GetMetrics() common.LogFields {
 	// delivered via inproxy.ClientConn/WebRTCConn GetMetrics.
 	logFields := common.LogFields{}
 
-	logFields["inproxy_webrtc_dtls_fingerprint"] = dialParams.DTLSFingerprint
+	if dialParams.DTLSFingerprint != "" {
+		logFields["inproxy_webrtc_dtls_fingerprint"] = dialParams.DTLSFingerprint
+	}
 
 	return logFields
 }
@@ -2425,6 +2484,7 @@ func (s *InproxyNATStateManager) reset() {
 	s.networkID = networkID
 	s.natType = inproxy.NATTypeUnknown
 	s.portMappingTypes = inproxy.PortMappingTypes{}
+	s.portMappingProbe = nil
 }
 
 func (s *InproxyNATStateManager) getNATType(
@@ -2505,6 +2565,57 @@ func (s *InproxyNATStateManager) setPortMappingProbe(
 	}
 
 	s.portMappingProbe = portMappingProbe
+}
+
+// inproxyProxyAnnouncementLimits relays tactics proxy limits overrides to the
+// specified inproxy proxy.
+type inproxyProxyAnnouncementLimits struct {
+	mutex  sync.Mutex
+	config *Config
+	proxy  *inproxy.Proxy
+}
+
+func newInproxyProxyAnnouncementLimits(
+	config *Config) *inproxyProxyAnnouncementLimits {
+
+	return &inproxyProxyAnnouncementLimits{
+		config: config,
+	}
+}
+
+func (limits *inproxyProxyAnnouncementLimits) SetProxy(proxy *inproxy.Proxy) error {
+
+	limits.mutex.Lock()
+	defer limits.mutex.Unlock()
+
+	limits.proxy = proxy
+
+	return errors.Trace(limits.setLimitsLocked())
+}
+
+// TacticsApplied implements the TacticsAppliedReceiver interface.
+func (limits *inproxyProxyAnnouncementLimits) TacticsApplied() error {
+
+	limits.mutex.Lock()
+	defer limits.mutex.Unlock()
+
+	return errors.Trace(limits.setLimitsLocked())
+}
+
+func (limits *inproxyProxyAnnouncementLimits) setLimitsLocked() error {
+
+	if limits.proxy == nil {
+		return nil
+	}
+
+	p := limits.config.GetParameters().Get()
+
+	commonOverride := p.Int(parameters.InproxyProxyAnnounceCommonOverride)
+	personalOverride := p.Int(parameters.InproxyProxyAnnouncePersonalOverride)
+
+	return errors.Trace(limits.proxy.OverrideAnnouncementLimits(
+		commonOverride,
+		personalOverride))
 }
 
 // inproxyUDPConn is based on NewUDPConn and includes the write timeout

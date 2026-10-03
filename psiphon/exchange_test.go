@@ -185,12 +185,13 @@ func TestServerEntryExchange(t *testing.T) {
 				return true
 			}
 
-			selectProtocol := func(serverEntry *protocol.ServerEntry, _ string) (string, bool) {
+			selectProtocol := func(serverEntry *protocol.ServerEntry, _ bool, _ string) (string, bool) {
 				return tunnelProtocol, true
 			}
 
 			dialParams, err := MakeDialParameters(
 				config,
+				nil,
 				nil,
 				nil,
 				nil,
@@ -201,7 +202,6 @@ func TestServerEntryExchange(t *testing.T) {
 				nil,
 				nil,
 				false,
-				0,
 				0)
 			if err != nil {
 				t.Fatalf("MakeDialParameters failed: %s", err)
@@ -230,7 +230,7 @@ func TestServerEntryExchange(t *testing.T) {
 		}
 		defer iterator.Close()
 
-		serverEntry, err := iterator.Next(ctx)
+		serverEntry, _, err := iterator.Next(ctx)
 		if err != nil {
 			t.Fatalf("ServerEntryIterator.Next failed: %s", err)
 		}

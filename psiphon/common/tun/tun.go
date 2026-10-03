@@ -1341,7 +1341,6 @@ func (session *session) isTrackingFlow(ID flowID) bool {
 // Flow tracking is used to implement:
 // - one-time permissions checks for a flow
 // - OSLs
-// - domain bytes transferred [TODO]
 // - DNS quality metrics
 //
 // The applicationData from the first packet in the flow is
@@ -1885,6 +1884,7 @@ type Client struct {
 	transparentDNS  *clientTransparentDNS
 	device          *Device
 	channel         *Channel
+	dropTraffic     atomic.Bool
 	upstreamPackets *PacketQueue
 	metrics         *packetMetrics
 	runContext      context.Context
@@ -1997,6 +1997,10 @@ func (client *Client) Start() {
 				continue
 			}
 
+			if client.IsDroppingTraffic() {
+				continue
+			}
+
 			// processPacket will check for packets the server will reject
 			// and drop those without sending.
 
@@ -2031,6 +2035,11 @@ func (client *Client) Start() {
 			if !ok {
 				// Dequeue aborted due to session.runContext.Done()
 				return
+			}
+
+			if client.IsDroppingTraffic() {
+				client.upstreamPackets.Replace(packetBuffer)
+				continue
 			}
 
 			err := client.channel.WriteFramedPackets(packetBuffer)
@@ -2068,6 +2077,10 @@ func (client *Client) Start() {
 				continue
 			}
 
+			if client.IsDroppingTraffic() {
+				continue
+			}
+
 			if !processPacket(
 				client.metrics,
 				nil,
@@ -2088,6 +2101,17 @@ func (client *Client) Start() {
 			}
 		}
 	}()
+}
+
+// DropTraffic toggles packet tunnel traffic dropping. When enabled, packets
+// read from the tun device and packet tunnel channel are drained and dropped.
+func (client *Client) DropTraffic(drop bool) {
+	client.dropTraffic.Store(drop)
+}
+
+// IsDroppingTraffic indicates whether packet tunnel traffic dropping is on.
+func (client *Client) IsDroppingTraffic() bool {
+	return client.dropTraffic.Load()
 }
 
 // Stop halts a running client.

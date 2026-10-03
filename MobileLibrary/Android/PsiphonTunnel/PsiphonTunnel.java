@@ -70,10 +70,8 @@ import psi.PsiphonProviderNoticeHandler;
 
 public class PsiphonTunnel {
 
-    /**
-     * A point-in-time snapshot of per-region proxy activity metrics.
-     * Used in onInproxyProxyActivity
-     */
+    // A point-in-time snapshot of per-region proxy activity metrics.
+    // Used in onInproxyProxyActivity
     public static class RegionActivitySnapshot {
         public long bytesUp;
         public long bytesDown;
@@ -112,6 +110,8 @@ public class PsiphonTunnel {
         default void onHttpProxyPortInUse(int port) {}
         default void onListeningSocksProxyPort(int port) {}
         default void onListeningHttpProxyPort(int port) {}
+        default void onListeningSocksProxyUnixPath(String path) {}
+        default void onListeningHttpProxyUnixPath(String path) {}
         default void onUpstreamProxyError(String message) {}
         default void onConnecting() {}
         default void onConnected() {}
@@ -122,14 +122,13 @@ public class PsiphonTunnel {
         default void onClientIsLatestVersion() {}
         default void onSplitTunnelRegions(List<String> regions) {}
         default void onUntunneledAddress(String address) {}
-        /**
-         * Called to report how many bytes have been transferred since the last time
-         * this function was called.
-         * By default onBytesTransferred is disabled. Enable it by setting
-         * EmitBytesTransferred to true in the Psiphon config.
-         * @param sent The number of bytes sent since the last call to onBytesTransferred.
-         * @param received The number of bytes received since the last call to onBytesTransferred.
-         */
+
+        // Called to report how many bytes have been transferred since the last time
+        // this function was called.
+        // By default onBytesTransferred is disabled. Enable it by setting
+        // EmitBytesTransferred to true in the Psiphon config.
+        // sent: The number of bytes sent since the last call to onBytesTransferred.
+        // received: The number of bytes received since the last call to onBytesTransferred.
         default void onBytesTransferred(long sent, long received) {}
         default void onStartedWaitingForNetworkConnectivity() {}
         default void onStoppedWaitingForNetworkConnectivity() {}
@@ -137,27 +136,25 @@ public class PsiphonTunnel {
         default void onTrafficRateLimits(long upstreamBytesPerSecond, long downstreamBytesPerSecond) {}
         default void onApplicationParameters(Object parameters) {}
         default void onServerAlert(String reason, String subject, List<String> actionURLs) {}
-        /**
-         * Called when tunnel-core reports that a selected in-proxy mode --
-         * including running a proxy; or running a client in personal pairing
-         * mode -- cannot function without an app upgrade. The receiver
-         * should alert the user to upgrade the app and/or disable the
-         * unsupported mode(s). This callback is followed by a tunnel-core
-         * shutdown.
-         */
+
+        // Called when tunnel-core reports that a selected in-proxy mode --
+        // including running a proxy; or running a client in personal pairing
+        // mode -- cannot function without an app upgrade. The receiver
+        // should alert the user to upgrade the app and/or disable the
+        // unsupported mode(s). This callback is followed by a tunnel-core
+        // shutdown.
         default void onInproxyMustUpgrade() {}
-        /**
-         * Called when tunnel-core reports proxy usage statistics.
-         * By default onInproxyProxyActivity is disabled. Enable it by setting
-         * EmitInproxyProxyActivity to true in the Psiphon config.
-         * @param announcing Number of new clients the proxy is accepting.
-         * @param connectingClients Number of clients connecting to the proxy.
-         * @param connectedClients Number of clients currently connected to the proxy.
-         * @param bytesUp  Bytes uploaded through the proxy since the last report.
-         * @param bytesDown Bytes downloaded through the proxy since the last report.
-         * @param personalRegionActivity Per-region activity metrics for personal proxy clients
-         * @param commonRegionActivity Per-region activity metrics for common proxy clients
-         */
+
+        // Called when tunnel-core reports proxy usage statistics.
+        // By default onInproxyProxyActivity is disabled. Enable it by setting
+        // EmitInproxyProxyActivity to true in the Psiphon config.
+        // announcing: Number of new clients the proxy is accepting.
+        // connectingClients: Number of clients connecting to the proxy.
+        // connectedClients: Number of clients currently connected to the proxy.
+        // bytesUp: Bytes uploaded through the proxy since the last report.
+        // bytesDown: Bytes downloaded through the proxy since the last report.
+        // personalRegionActivity: Per-region activity metrics for personal proxy clients
+        // commonRegionActivity: Per-region activity metrics for common proxy clients
         default void onInproxyProxyActivity(
             int announcing, 
             int connectingClients, 
@@ -166,15 +163,22 @@ public class PsiphonTunnel {
             long bytesDown,
             Map<String, RegionActivitySnapshot> personalRegionActivity,
             Map<String, RegionActivitySnapshot> commonRegionActivity) {}
-        /**
-         * Called when tunnel-core reports connected server region information.
-         * @param region The server region received.
-         */
+
+        // Called when tunnel-core reports connected server region information.
+        // region: The server region received.
         default void onConnectedServerRegion(String region) {}
-        /**
-         * Called when a light proxy is available to use even when no tunnel is connected.
-         */
+
+        // Called when a light proxy is available to use even when no tunnel is connected.
         default void onLightProxyAvailable() {}
+
+        // Called with a persisted opaque access token at startup, if available, and whenever a
+        // changed token has been persisted. Requires EnableDSLAccessTokenRegistration in the config.
+        // The token may be used for push notifications; it is not an FCM or APNs device token.
+        // Delivered synchronously; dispatch work asynchronously before calling PsiphonTunnel APIs
+        // from this callback.
+        // @param token The access token as unpadded Base64URL text.
+        default void onAccessToken(String token) {}
+
         default void onExiting() {}
     }
 
@@ -252,14 +256,19 @@ public class PsiphonTunnel {
     // Public API
     //----------------------------------------------------------------------------------------------
 
+    // Start Psiphon.
+    //
     // Throws an exception if start fails. The caller may examine the exception message
     // to determine the cause of the error.
+    //
+    // Direct calls from a HostService callback is unsupported as this can deadlock.
     public synchronized void startTunneling(String embeddedServerEntries) throws Exception {
         startPsiphon(embeddedServerEntries);
     }
 
-    // Note: to avoid deadlock, do not call directly from a HostService callback;
-    // instead post to a Handler if necessary to trigger from a HostService callback.
+    // Stop Psiphon.
+    //
+    // Direct calls from a HostService callback is unsupported as this can deadlock.
     // For example, deadlock can occur when a Notice callback invokes stop() since stop() calls
     // Psi.stop() which will block waiting for tunnel-core Controller to shutdown which in turn
     // waits for Notice callback invoker to stop, meanwhile the callback thread has blocked waiting
@@ -270,30 +279,45 @@ public class PsiphonTunnel {
         mLocalSocksProxyPort.set(0);
     }
 
+    // Stop and start Psiphon.
+    //
     // Note: same deadlock note as stop().
     public synchronized void restartPsiphon() throws Exception {
         stopPsiphon();
         startPsiphon("");
     }
 
-    public synchronized void reconnectPsiphon() throws Exception {
+    // Trigger a Psiphon tunnel reconnect.
+    //
+    // Direct calls from a HostService callback is unsupported as this can deadlock.
+    public void reconnectPsiphon() throws Exception {
         Psi.reconnectTunnel();
     }
 
+    // Toggle packet tunnel mode traffic dropping.
+    //
+    // Direct calls from a HostService callback is unsupported as this can deadlock.
+    public void dropPacketTunnelTraffic(boolean drop) {
+        Psi.dropPacketTunnelTraffic(drop);
+    }
+
     // Notify Psiphon that the host app has resumed from background.
-    public synchronized void appResumed() {
+    //
+    // Direct calls from a HostService callback is unsupported as this can deadlock.
+    public void appResumed() {
         Psi.appResumed();
     }
 
-    public void setClientPlatformAffixes(String prefix, String suffix) {
-        mClientPlatformPrefix.set(prefix);
-        mClientPlatformSuffix.set(suffix);
-    }
-
+    // Export an exchange payload.
+    //
+    // Direct calls from a HostService callback is unsupported as this can deadlock.
     public String exportExchangePayload() {
         return Psi.exportExchangePayload();
     }
 
+    // Import an exchange payload.
+    //
+    // Direct calls from a HostService callback is unsupported as this can deadlock.
     public boolean importExchangePayload(String payload) {
         return Psi.importExchangePayload(payload);
     }
@@ -307,13 +331,42 @@ public class PsiphonTunnel {
     // Returns true if the import succeeded and false on any error. Error
     // details are logged to diagnostics. If an import is partially
     // successful, the imported server entries are retained and prioritized.
+    //
+    // Direct calls from a HostService callback is unsupported as this can deadlock.
     public boolean importPushPayload(byte[] payload) {
         return Psi.importPushPayload(payload);
+    }
+
+    // Returns the persisted opaque access token. The token may be used for push notifications; it
+    // is not an FCM or APNs device token. Returns an empty string when Psiphon is not running, no
+    // token has been registered, or retrieval fails; retrieval errors are logged to diagnostics.
+    //
+    // Direct calls from a HostService callback is unsupported as this can deadlock.
+    public String getAccessToken() {
+        return Psi.getDSLAccessToken();
+    }
+
+    // Record client event attributed to the current tunnel or light proxy.
+    // Attribution follows the type used by the most recent successful application
+    // port forward dial. Call recordClientEvent as soon as practical after the
+    // event occurs.
+    //
+    // Direct calls from a HostService callback is unsupported as this can deadlock.
+    public void recordClientEvent(String event) {
+        Psi.recordClientEvent(event);
+    }
+
+    // Specify a prefix/suffix for the reported client platform.
+    public void setClientPlatformAffixes(String prefix, String suffix) {
+        mClientPlatformPrefix.set(prefix);
+        mClientPlatformSuffix.set(suffix);
     }
 
     // Writes Go runtime profile information to a set of files in the specifiec output directory.
     // cpuSampleDurationSeconds and blockSampleDurationSeconds determines how to long to wait and
     // sample profiles that require active sampling. When set to 0, these profiles are skipped.
+    //
+    // Direct calls from a HostService callback is unsupported as this can deadlock.
     public void writeRuntimeProfiles(String outputDirectory, int cpuSampleDurationSeconds, int blockSampleDurationSeconds) {
         Psi.writeRuntimeProfiles(outputDirectory, cpuSampleDurationSeconds, blockSampleDurationSeconds);
     }
@@ -560,6 +613,11 @@ public class PsiphonTunnel {
         @Override
         public void notice(String noticeJSON) {
             mPsiphonTunnel.notice(noticeJSON);
+        }
+
+        @Override
+        public void onAccessToken(String token) {
+            mHostService.onAccessToken(token);
         }
 
         @Override
@@ -909,6 +967,10 @@ public class PsiphonTunnel {
             } else if (noticeType.equals("ListeningHttpProxyPort")) {
                 int port = notice.getJSONObject("data").getInt("port");
                 mHostService.onListeningHttpProxyPort(port);
+            } else if (noticeType.equals("ListeningSocksProxyUnixPath")) {
+                mHostService.onListeningSocksProxyUnixPath(notice.getJSONObject("data").getString("path"));
+            } else if (noticeType.equals("ListeningHttpProxyUnixPath")) {
+                mHostService.onListeningHttpProxyUnixPath(notice.getJSONObject("data").getString("path"));
             } else if (noticeType.equals("UpstreamProxyError")) {
                 diagnostic = false;
                 mHostService.onUpstreamProxyError(notice.getJSONObject("data").getString("message"));
@@ -1019,25 +1081,58 @@ public class PsiphonTunnel {
         return result;
     }
 
-    private static String getDeviceRegion(Context context) {
+    // Returns the uppercase region identifier that the device is probably located in. This is the
+    // same best-effort approximation that the Psiphon library reports as the DeviceRegion metric.
+    //
+    // The value is derived, in order of preference, from the current mobile network, the SIM, and
+    // the default locale. The network country is skipped for CDMA devices, where it is not
+    // meaningful. This is an approximation, not authoritative geolocation, and locale-derived
+    // identifiers are not guaranteed to be two-letter ISO 3166-1 country codes.
+    //
+    // context: an Android Context used to obtain the telephony service.
+    // Returns an uppercase region identifier, or an empty string if none can be determined.
+    // Throws NullPointerException if context is null.
+    public static String getDeviceRegion(Context context) {
+        if (context == null) {
+            throw new NullPointerException("context");
+        }
+
         String region = "";
-        TelephonyManager telephonyManager = (TelephonyManager)context.getSystemService(Context.TELEPHONY_SERVICE);
+        TelephonyManager telephonyManager = null;
+        try {
+            telephonyManager = (TelephonyManager)context.getSystemService(Context.TELEPHONY_SERVICE);
+        } catch (RuntimeException e) {
+            // Some OEM implementations may throw while obtaining the telephony service.
+            // Fall through to the locale.
+        }
+
         if (telephonyManager != null) {
             // getNetworkCountryIso, when present, is preferred over
             // getSimCountryIso, since getNetworkCountryIso is the network
             // the device is currently on, while getSimCountryIso is the home
             // region of the SIM. While roaming, only getNetworkCountryIso
             // may more accurately represent the actual device region.
-            if (telephonyManager.getPhoneType() != TelephonyManager.PHONE_TYPE_CDMA) {
-                region = telephonyManager.getNetworkCountryIso();
-                if (region == null) {
-                    region = "";
+            try {
+                if (telephonyManager.getPhoneType() != TelephonyManager.PHONE_TYPE_CDMA) {
+                    String networkCountry = telephonyManager.getNetworkCountryIso();
+                    if (networkCountry != null) {
+                        region = networkCountry;
+                    }
                 }
+            } catch (RuntimeException e) {
+                // May get exceptions due to missing permissions or OEM implementations.
+                // Fall through and try the SIM country.
             }
+
             if (region.length() == 0) {
-                region = telephonyManager.getSimCountryIso();
-                if (region == null) {
-                    region = "";
+                try {
+                    String simCountry = telephonyManager.getSimCountryIso();
+                    if (simCountry != null) {
+                        region = simCountry;
+                    }
+                } catch (RuntimeException e) {
+                    // May get exceptions due to missing permissions or OEM implementations.
+                    // Fall through to the locale.
                 }
             }
         }

@@ -324,6 +324,7 @@ func runQUIC(
 	expectedDanglingGoroutines := []string{
 		"quic-go.(*packetHandlerMap).Retire.func1",
 		"quic-go.(*packetHandlerMap).ReplaceWithClosed.func1",
+		"quic-go.(*packetHandlerMap).ReplaceWithClosed.func2",
 		"quic-go.(*packetHandlerMap).RetireResetToken.func1",
 		"gquic-go.(*packetHandlerMap).removeByConnectionIDAsString.func1",
 	}
@@ -379,9 +380,16 @@ func (conn *countReadsConn) getReadCount() int {
 
 func getGoroutines() []runtime.StackRecord {
 	n, _ := runtime.GoroutineProfile(nil)
-	r := make([]runtime.StackRecord, n)
-	runtime.GoroutineProfile(r)
-	return r
+	for {
+		r := make([]runtime.StackRecord, n)
+		var ok bool
+		n, ok = runtime.GoroutineProfile(r)
+		if ok {
+			return r[:n]
+		}
+		// Retry; a goroutine may have spawned between GoroutineProfile calls,
+		// so n is now too small.
+	}
 }
 
 func checkDanglingGoroutines(

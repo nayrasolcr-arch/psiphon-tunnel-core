@@ -733,6 +733,10 @@ func noticeWithDialParameters(noticeType string, dialParams *DialParameters, pos
 			args = append(args, "DSLPrioritizedTunnelProtocol", dialParams.DSLPrioritizedTunnelProtocol)
 		}
 
+		if dialParams.TunnelLightProxyID != "" {
+			args = append(args, "tunnelPersonalLightProxyID", dialParams.TunnelLightProxyID)
+		}
+
 	}
 
 	singletonNoticeLogger.outputNotice(
@@ -846,6 +850,20 @@ func NoticeListeningHttpProxyPort(port int) {
 	singletonNoticeLogger.outputNotice(
 		"ListeningHttpProxyPort", 0,
 		"port", port)
+}
+
+// NoticeListeningSocksProxyUnixPath is the Unix domain socket path for the listening local SOCKS proxy
+func NoticeListeningSocksProxyUnixPath(path string) {
+	singletonNoticeLogger.outputNotice(
+		"ListeningSocksProxyUnixPath", 0,
+		"path", path)
+}
+
+// NoticeListeningHttpProxyUnixPath is the Unix domain socket path for the listening local HTTP proxy
+func NoticeListeningHttpProxyUnixPath(path string) {
+	singletonNoticeLogger.outputNotice(
+		"ListeningHttpProxyUnixPath", 0,
+		"path", path)
 }
 
 // NoticeClientUpgradeAvailable is an available client upgrade, as per the handshake. The
@@ -1262,6 +1280,25 @@ func NoticeInproxyProxyTotalActivity(
 // NoticeLightProxyAvailable indicates that a light proxy is available for use.
 func NoticeLightProxyAvailable() {
 	singletonNoticeLogger.outputNotice("LightProxyAvailable", 0)
+}
+
+// NoticeDSLAccessTokenAvailable indicates that an opaque DSL access token is
+// available to fetch via GetDSLAccessToken. The token is intentionally omitted
+// from the notice.
+func NoticeDSLAccessTokenAvailable() {
+	singletonNoticeLogger.outputNotice("DSLAccessTokenAvailable", 0)
+}
+
+// NoticeClientEventDropped reports a local client event drop once per reason.
+func NoticeClientEventDropped(reason string) {
+	if !GetEmitDiagnosticNotices() {
+		return
+	}
+
+	outputRepetitiveNotice(
+		"ClientEventDropped-"+reason, "", 0,
+		"ClientEventDropped", noticeIsDiagnostic,
+		"message", "dropped event: "+reason)
 }
 
 type repetitiveNoticeState struct {

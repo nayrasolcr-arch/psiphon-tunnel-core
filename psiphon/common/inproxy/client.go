@@ -172,10 +172,6 @@ func DialClient(
 		return nil, errors.TraceNew("unexpected DialNetworkProtocol")
 	}
 
-	// Reset and configure port mapper component, as required. See
-	// initPortMapper comment.
-	initPortMapper(config.WebRTCDialCoordinator)
-
 	// Future improvements:
 	//
 	// - The broker connection and session, when not already established,
@@ -444,7 +440,7 @@ func dialClientWebRTCConn(
 
 	// Initialize the WebRTC offer
 
-	dtlsFingerprint := config.WebRTCDialCoordinator.DTLSFingerprint()
+	dtlsFingerprint := config.WebRTCDialCoordinator.ClientDTLSFingerprint()
 	useMediaStreams := config.WebRTCDialCoordinator.UseMediaStreams()
 	trafficShapingParameters := config.WebRTCDialCoordinator.TrafficShapingParameters()
 	clientRootObfuscationSecret := config.WebRTCDialCoordinator.ClientRootObfuscationSecret()

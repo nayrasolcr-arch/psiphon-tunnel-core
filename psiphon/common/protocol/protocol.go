@@ -91,7 +91,6 @@ const (
 	PSIPHON_API_TUNNEL_ID_LENGTH = 16
 
 	PSIPHON_API_PROTOCOL_SSH  = "ssh"
-	PSIPHON_API_PROTOCOL_WEB  = "web"
 	PSIPHON_API_ENCODING_CBOR = "cbor"
 	PSIPHON_API_ENCODING_JSON = "json"
 
@@ -133,8 +132,7 @@ func AllowServerEntrySourceWithUpstreamProxy(source string) bool {
 }
 
 func PsiphonAPIProtocolIsValid(protocol string) bool {
-	return protocol == PSIPHON_API_PROTOCOL_SSH ||
-		protocol == PSIPHON_API_PROTOCOL_WEB
+	return protocol == PSIPHON_API_PROTOCOL_SSH
 }
 
 func PsiphonAPIEncodingIsValid(protocol string) bool {
@@ -481,7 +479,9 @@ func TunnelProtocolSupportsPassthrough(protocol string) bool {
 
 func TunnelProtocolSupportsUpstreamProxy(protocol string) bool {
 	return !TunnelProtocolUsesInproxy(protocol) &&
-		!TunnelProtocolUsesQUIC(protocol)
+		!TunnelProtocolUsesQUIC(protocol) &&
+		// Conjure DTLS uses UDP.
+		!TunnelProtocolUsesRefractionNetworking(protocol)
 }
 
 func TunnelProtocolSupportsTactics(protocol string) bool {
@@ -627,6 +627,8 @@ const (
 	TLS_PROFILE_CHROME_112_PSK = "Chrome-112_PSK"
 	TLS_PROFILE_CHROME_120     = "Chrome-120"
 	TLS_PROFILE_CHROME_120_PQ  = "Chrome-120_PQ"
+	TLS_PROFILE_CHROME_131     = "Chrome-131"
+	TLS_PROFILE_CHROME_133     = "Chrome-133"
 	TLS_PROFILE_FIREFOX_55     = "Firefox-55"
 	TLS_PROFILE_FIREFOX_56     = "Firefox-56"
 	TLS_PROFILE_FIREFOX_65     = "Firefox-65"
@@ -634,6 +636,9 @@ const (
 	TLS_PROFILE_FIREFOX_105    = "Firefox-105"
 	TLS_PROFILE_RANDOMIZED     = "Randomized-v2"
 )
+
+// When SupportedTLSProfiles is updated, common/light.tlsProfileToCode must be
+// updated.
 
 var SupportedTLSProfiles = TLSProfiles{
 	TLS_PROFILE_IOS_111,
@@ -652,6 +657,8 @@ var SupportedTLSProfiles = TLSProfiles{
 	TLS_PROFILE_CHROME_112_PSK,
 	TLS_PROFILE_CHROME_120,
 	TLS_PROFILE_CHROME_120_PQ,
+	TLS_PROFILE_CHROME_131,
+	TLS_PROFILE_CHROME_133,
 	TLS_PROFILE_FIREFOX_55,
 	TLS_PROFILE_FIREFOX_56,
 	TLS_PROFILE_FIREFOX_65,
@@ -903,21 +910,21 @@ func (transports ConjureTransports) PruneInvalid() ConjureTransports {
 }
 
 type HandshakeResponse struct {
-	Homepages                 []string            `json:"homepages,omitempty" cbor:"1,keyasint,omitempty"`
-	UpgradeClientVersion      string              `json:"upgrade_client_version,omitempty" cbor:"2,keyasint,omitempty"`
-	PageViewRegexes           []map[string]string `json:"page_view_regexes,omitempty" cbor:"3,keyasint,omitempty"`
-	HttpsRequestRegexes       []map[string]string `json:"https_request_regexes,omitempty" cbor:"4,keyasint,omitempty"`
-	EncodedServerList         []string            `json:"encoded_server_list,omitempty" cbor:"5,keyasint,omitempty"`
-	ClientRegion              string              `json:"client_region,omitempty" cbor:"6,keyasint,omitempty"`
-	ClientAddress             string              `json:"client_address,omitempty" cbor:"7,keyasint,omitempty"`
-	ServerTimestamp           string              `json:"server_timestamp,omitempty" cbor:"8,keyasint,omitempty"`
-	ActiveAuthorizationIDs    []string            `json:"active_authorization_ids,omitempty" cbor:"9,keyasint,omitempty"`
-	TacticsPayload            json.RawMessage     `json:"tactics_payload,omitempty" cbor:"10,keyasint,omitempty"`
-	TacticsPayloadCompression int32               `json:"tactics_payload_compression,omitempty" cbor:"11,keyasint,omitempty"`
-	UpstreamBytesPerSecond    int64               `json:"upstream_bytes_per_second,omitempty" cbor:"12,keyasint,omitempty"`
-	DownstreamBytesPerSecond  int64               `json:"downstream_bytes_per_second,omitempty" cbor:"13,keyasint,omitempty"`
-	SteeringIP                string              `json:"steering_ip,omitempty" cbor:"14,keyasint,omitempty"`
-	Padding                   string              `json:"padding,omitempty" cbor:"15,keyasint,omitempty"`
+	Homepages                 []string        `json:"homepages,omitempty" cbor:"1,keyasint,omitempty"`
+	UpgradeClientVersion      string          `json:"upgrade_client_version,omitempty" cbor:"2,keyasint,omitempty"`
+	EncodedServerList         []string        `json:"encoded_server_list,omitempty" cbor:"5,keyasint,omitempty"`
+	ClientRegion              string          `json:"client_region,omitempty" cbor:"6,keyasint,omitempty"`
+	ClientAddress             string          `json:"client_address,omitempty" cbor:"7,keyasint,omitempty"`
+	ServerTimestamp           string          `json:"server_timestamp,omitempty" cbor:"8,keyasint,omitempty"`
+	ActiveAuthorizationIDs    []string        `json:"active_authorization_ids,omitempty" cbor:"9,keyasint,omitempty"`
+	TacticsPayload            json.RawMessage `json:"tactics_payload,omitempty" cbor:"10,keyasint,omitempty"`
+	TacticsPayloadCompression int32           `json:"tactics_payload_compression,omitempty" cbor:"11,keyasint,omitempty"`
+	UpstreamBytesPerSecond    int64           `json:"upstream_bytes_per_second,omitempty" cbor:"12,keyasint,omitempty"`
+	DownstreamBytesPerSecond  int64           `json:"downstream_bytes_per_second,omitempty" cbor:"13,keyasint,omitempty"`
+	SteeringIP                string          `json:"steering_ip,omitempty" cbor:"14,keyasint,omitempty"`
+	Padding                   string          `json:"padding,omitempty" cbor:"15,keyasint,omitempty"`
+
+	// CBOR keys 3 and 4 are retired.
 }
 
 type ConnectedResponse struct {

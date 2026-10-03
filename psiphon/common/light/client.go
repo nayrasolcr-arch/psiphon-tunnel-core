@@ -24,6 +24,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -36,7 +37,11 @@ import (
 )
 
 const (
-	clientInactivityTimeout = 5 * time.Minute
+	// Matches default parameters.LightProxyInactivityTimeout
+	clientInactivityTimeout = 2 * time.Minute
+
+	// NoInactivityTimeout disables the client read inactivity timeout.
+	NoInactivityTimeout time.Duration = -1
 )
 
 // TCPDialer is a callback that dials a TCP connection. The dialer allows for
@@ -49,12 +54,18 @@ type TCPDialer func(
 // underlying TCP connection. The dialer allows for integrating Psiphon
 // features including utls, passthrough, pin verification, session caching,
 // and replay.
+//
+// The specified tlsProfile must be a utls TLS 1.3 ClientHello parrot
+// fingerprint, or a randomized fingerprint that produces a TLS 1.3
+// ClientHello with the given randomizedTLSProfileSeed.
 type TLSDialer func(
 	ctx context.Context,
 	underlyingConn net.Conn,
 	tlsProfile string,
 	randomizedTLSProfileSeed *prng.Seed,
 	sni string,
+	fragmentClientHello bool,
+	tlsPadding int,
 	passthroughMessage []byte,
 	verifyPin string,
 	verifyServerName string) (net.Conn, error)
@@ -88,18 +99,22 @@ type Client struct {
 	obfuscationKey    string
 	verifyPin         string
 	connectionNumber  atomic.Int64
-	dialIPv4Count     atomic.Int64
-	dialIPv6Count     atomic.Int64
-	dialFailedCount   atomic.Int64
+
+	metricsMutex      sync.Mutex
+	dialIPv4Count     int
+	dialIPv6Count     int
+	dialFailedCount   int
+	dialCanceledCount int
 }
 
 type ClientMetrics struct {
 	ProxyID           string
 	ProxyEntryTracker int64
-	DialIPv4Count     int64
 	HasIPv6           bool
-	DialIPv6Count     int64
-	DialFailedCount   int64
+	DialIPv4Count     int
+	DialIPv6Count     int
+	DialFailedCount   int
+	DialCanceledCount int
 }
 
 // NewClient initializes a Client.
@@ -122,7 +137,15 @@ func NewClient(config *ClientConfig) (*Client, error) {
 
 	clientPlatform := encodeClientPlatform(config.ClientPlatform)
 
-	clientBuildRev, err := hex.DecodeString(config.ClientBuildRev)
+	// Truncate odd length client build revs to enable conversion to binary.
+	// This is a fail safe: the build script should set a sufficiently long,
+	// even-length build rev.
+	hexClientBuildRev := config.ClientBuildRev
+	if len(hexClientBuildRev)%2 == 1 {
+		hexClientBuildRev = hexClientBuildRev[:len(hexClientBuildRev)-1]
+	}
+
+	clientBuildRev, err := hex.DecodeString(hexClientBuildRev)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -175,39 +198,111 @@ func (client *Client) GetRecommendedSNIRegex() string {
 	return client.proxyEntry.RecommendedSNIRegex
 }
 
-func (client *Client) GetMetrics() *ClientMetrics {
-	return &ClientMetrics{
+// GetRecommendedSNIProbability returns the recommended SNI probability
+// included in the proxy entry.
+func (client *Client) GetRecommendedSNIProbability() float64 {
+	return client.proxyEntry.RecommendedSNIProbability
+}
+
+// GetRecommendedTLSProfile returns the recommended TLS profile included in
+// the proxy entry, if any.
+func (client *Client) GetRecommendedTLSProfile() string {
+	return client.proxyEntry.RecommendedTLSProfile
+}
+
+// GetRecommendedTLSProfileProbability returns the recommended TLS profile
+// probability included in the proxy entry.
+func (client *Client) GetRecommendedTLSProfileProbability() float64 {
+	return client.proxyEntry.RecommendedTLSProfileProbability
+}
+
+// GetRecommendedFragmentClientHelloProbability returns the recommended
+// FragmentClientHello probability included in the proxy entry.
+func (client *Client) GetRecommendedFragmentClientHelloProbability() float64 {
+	return client.proxyEntry.RecommendedFragmentClientHelloProbability
+}
+
+// GetRecommendedTLSPaddingProbability returns the recommended TLS padding
+// probability included in the proxy entry.
+func (client *Client) GetRecommendedTLSPaddingProbability() float64 {
+	return client.proxyEntry.RecommendedTLSPaddingProbability
+}
+
+// GetRecommendedMinTLSPadding returns the recommended minimum TLS padding
+// included in the proxy entry.
+func (client *Client) GetRecommendedMinTLSPadding() int {
+	return client.proxyEntry.RecommendedMinTLSPadding
+}
+
+// GetRecommendedMaxTLSPadding returns the recommended maximum TLS padding
+// included in the proxy entry.
+func (client *Client) GetRecommendedMaxTLSPadding() int {
+	return client.proxyEntry.RecommendedMaxTLSPadding
+}
+
+// GetMetrics returns ClientMetrics stats for the light client. If
+// resetCounters is true, cumulative dial success/failed/cancel metrics
+// counters are reset to zero after reporting current values.
+func (client *Client) GetMetrics(resetCounters bool) *ClientMetrics {
+	client.metricsMutex.Lock()
+	defer client.metricsMutex.Unlock()
+
+	metrics := &ClientMetrics{
 		ProxyID:           client.proxyID,
 		ProxyEntryTracker: client.config.ProxyEntryTracker,
-		DialIPv4Count:     client.dialIPv4Count.Load(),
 		HasIPv6:           client.proxyEntry.DialAddressIPv6 != "",
-		DialIPv6Count:     client.dialIPv6Count.Load(),
-		DialFailedCount:   client.dialFailedCount.Load(),
+		DialIPv4Count:     client.dialIPv4Count,
+		DialIPv6Count:     client.dialIPv6Count,
+		DialFailedCount:   client.dialFailedCount,
+		DialCanceledCount: client.dialCanceledCount,
 	}
+
+	if resetCounters {
+		client.dialIPv4Count = 0
+		client.dialIPv6Count = 0
+		client.dialFailedCount = 0
+		client.dialCanceledCount = 0
+	}
+
+	return metrics
 }
 
 // Dial connects to the specified destination.
 //
 // The light proxy protocol requires the client to write first, and the light
 // header is prepended to the client's first write.
+//
+// inactivityTimeout specifies the read inactivity timeout. When zero, the
+// default timeout is applied. NoInactivityTimeout disables the timeout.
+//
+// The specified tlsProfile must be a utls TLS 1.3 ClientHello parrot
+// fingerprint, or a randomized fingerprint that produces a TLS 1.3
+// ClientHello with the given randomizedTLSProfileSeed.
 func (client *Client) Dial(
 	ctx context.Context,
 	additionalLogFields common.LogFields,
+	inactivityTimeout time.Duration,
 	networkType string,
 	tlsProfile string,
 	randomizedTLSProfileSeed *prng.Seed,
 	sni string,
+	fragmentClientHello bool,
+	tlsPadding int,
 	destinationAddress string) (retConn *ClientConn, retErr error) {
+
+	switch {
+	case inactivityTimeout == NoInactivityTimeout:
+		// ActivityMonitoredConn uses zero to disable its timeout.
+		inactivityTimeout = 0
+	case inactivityTimeout < 0:
+		return nil, errors.TraceNew("invalid inactivity timeout")
+	case inactivityTimeout == 0:
+		inactivityTimeout = clientInactivityTimeout
+	}
 
 	// Start at 1 to distinguish from the zero value the proxy will record if
 	// the header is not delivered.
 	connectionNum := client.connectionNumber.Add(1)
-
-	passthroughMessage, err := obfuscator.MakeTLSPassthroughMessage(
-		true, client.obfuscationKey)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
 
 	logFields := common.LogFields{
 		"proxyID":           client.proxyID,
@@ -215,20 +310,45 @@ func (client *Client) Dial(
 		"connectionNum":     connectionNum,
 		"tlsProfile":        tlsProfile,
 		"SNI":               sni,
+		"tlsFragment":       fragmentClientHello,
+		"tlsPadding":        tlsPadding,
 		"hasIPv6":           client.proxyEntry.DialAddressIPv6 != "",
 	}
 	logFields.Add(additionalLogFields)
 
-	// Log once per connection. If the dial fails, log accumulated fields
+	client.config.Logger.WithTraceFields(
+		logFields).Info("light proxy connection start")
+
+	// Log the connection outcome. If the dial fails, log accumulated fields
 	// here. Otherwise, log on Close.
 	defer func() {
-		if retErr != nil && ctx.Err() == nil {
-			client.dialFailedCount.Add(1)
-			logFields["error"] = retErr.Error()
-			client.config.Logger.WithTraceFields(
-				logFields).Warning("light proxy dial failed")
+		if retErr != nil {
+			ctxErr := ctx.Err()
+
+			client.metricsMutex.Lock()
+			if ctxErr == context.Canceled {
+				client.dialCanceledCount += 1
+			} else {
+				client.dialFailedCount += 1
+			}
+			client.metricsMutex.Unlock()
+
+			if ctxErr != context.Canceled {
+				logFields["error"] = retErr.Error()
+				client.config.Logger.WithTraceFields(
+					logFields).Warning("light proxy dial failed")
+			} else {
+				client.config.Logger.WithTraceFields(
+					logFields).Info("light proxy dial canceled")
+			}
 		}
 	}()
+
+	passthroughMessage, err := obfuscator.MakeTLSPassthroughMessage(
+		true, client.obfuscationKey)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
 
 	start := time.Now()
 
@@ -295,9 +415,15 @@ func (client *Client) Dial(
 	logFields["isIPv6"] = isIPv6
 
 	// Wrapping here counts outer TLS handshake bytes.
+	//
+	// activeOnWrite is false: writes succeed locally, buffered by the OS,
+	// even when the peer is unreachable. A trickle of small writes on a dead
+	// connection could extend the deadline indefinitely.
 	bytesCounter := &bytesCounter{}
 	activityConn, err := common.NewActivityMonitoredConn(
-		tcpConn, clientInactivityTimeout, false, nil, bytesCounter)
+		tcpConn,
+		inactivityTimeout,
+		false, nil, bytesCounter)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -309,6 +435,8 @@ func (client *Client) Dial(
 		tlsProfile,
 		randomizedTLSProfileSeed,
 		sni,
+		fragmentClientHello,
+		tlsPadding,
 		passthroughMessage,
 		client.verifyPin,
 		client.proxyEntry.VerifyServerName)
@@ -318,6 +446,7 @@ func (client *Client) Dial(
 	TLSDuration := time.Since(start)
 
 	logFields["TLSDuration"] = TLSDuration.String()
+	// TODO: log tlsConn.ConnectionState().DidResume
 
 	header, err := newLightHeader(
 		client.sponsorID,
@@ -347,11 +476,13 @@ func (client *Client) Dial(
 		bytesCounter:  bytesCounter,
 	}
 
+	client.metricsMutex.Lock()
 	if isIPv6 {
-		client.dialIPv6Count.Add(1)
+		client.dialIPv6Count += 1
 	} else {
-		client.dialIPv4Count.Add(1)
+		client.dialIPv4Count += 1
 	}
+	client.metricsMutex.Unlock()
 
 	return clientConn, nil
 }
@@ -368,6 +499,27 @@ type ClientConn struct {
 	closeErr  error
 }
 
+func (conn *ClientConn) Read(b []byte) (int, error) {
+	n, err := conn.lightConn.Read(b)
+
+	// Preserve io.Reader EOF semantics. Other errors, including EOF wrapped
+	// after an incomplete frame, retain the client connection number.
+	if err != nil && err != io.EOF {
+		return n, errors.Tracef(
+			"connectionNum %d: %w", conn.connectionNum, err)
+	}
+	return n, err
+}
+
+func (conn *ClientConn) Write(b []byte) (int, error) {
+	n, err := conn.lightConn.Write(b)
+	if err != nil {
+		return n, errors.Tracef(
+			"connectionNum %d: %w", conn.connectionNum, err)
+	}
+	return n, nil
+}
+
 func (conn *ClientConn) Close() error {
 	conn.closeOnce.Do(func() {
 		conn.closeErr = errors.Trace(conn.lightConn.Close())
@@ -377,7 +529,11 @@ func (conn *ClientConn) Close() error {
 		conn.logFields["duration"] = conn.activityConn.GetActiveDuration().String()
 
 		conn.client.config.Logger.WithTraceFields(
-			conn.logFields).Info("light proxy connection")
+			conn.logFields).Info("light proxy connection end")
 	})
 	return conn.closeErr
+}
+
+func (conn *ClientConn) IsClosed() bool {
+	return conn.activityConn.IsClosed()
 }

@@ -292,6 +292,11 @@ type Filter struct {
 	// Values may be patterns containing the '*' wildcard.
 	APIParameters map[string][]string
 
+	// ClientFeatures specifies client feature values, at least one
+	// of which must be present to match this filter. Values are matched
+	// exactly.
+	ClientFeatures []string
+
 	// Min/MaxClientVersion specify version constraints the client must match.
 	MinClientVersion *int
 	MaxClientVersion *int
@@ -300,10 +305,11 @@ type Filter struct {
 	// client speed test samples must satisfy.
 	SpeedTestRTTMilliseconds *Range
 
-	regionLookup common.StringLookup
-	ispLookup    common.StringLookup
-	asnLookup    common.StringLookup
-	cityLookup   common.StringLookup
+	regionLookup        common.StringLookup
+	ispLookup           common.StringLookup
+	asnLookup           common.StringLookup
+	cityLookup          common.StringLookup
+	clientFeatureLookup common.StringLookup
 }
 
 // Range is a filter field which specifies that the aggregation of
@@ -690,6 +696,8 @@ func (server *Server) initLookups() {
 			filteredTactics.Filter.ASNs)
 		filteredTactics.Filter.cityLookup = common.NewStringLookup(
 			filteredTactics.Filter.Cities)
+		filteredTactics.Filter.clientFeatureLookup = common.NewStringLookup(
+			filteredTactics.Filter.ClientFeatures)
 
 		// Initialize the filter GeoIP scope fields used by GetFilterGeoIPScope.
 		//
@@ -754,6 +762,12 @@ func (server *Server) initLookups() {
 // flags. For the given geoIPData, all tactics filters reference only the
 // flagged fields.
 func (server *Server) GetFilterGeoIPScope(geoIPData common.GeoIPData) int {
+
+	// Scope fields are updated by initLookups, so synchronize access.
+	//
+	// Potential future enhancement: store a snapshot in an atomic.Value?
+	server.ReloadableFile.RLock()
+	defer server.ReloadableFile.RUnlock()
 
 	scope := server.filterGeoIPScope
 
@@ -918,6 +932,8 @@ func (server *Server) getTactics(
 
 	var aggregatedValues map[string]int
 	filterMatchCount := 0
+	var clientFeatures []string
+	var clientFeaturesParsed bool
 
 	// Use the filterMatches buffer pool to avoid an allocation per getTactics
 	// call.
@@ -964,6 +980,25 @@ func (server *Server) getTactics(
 				}
 			}
 			if mismatch {
+				continue
+			}
+		}
+
+		if len(filteredTactics.Filter.ClientFeatures) > 0 {
+			if !clientFeaturesParsed {
+				clientFeatures, _ = getStringArrayRequestParam(
+					apiParams, "client_features")
+				clientFeaturesParsed = true
+			}
+
+			match := false
+			for _, clientFeature := range clientFeatures {
+				if filteredTactics.Filter.clientFeatureLookup.Contains(clientFeature) {
+					match = true
+					break
+				}
+			}
+			if !match {
 				continue
 			}
 		}
@@ -1111,6 +1146,32 @@ func getStringRequestParam(apiParams common.APIParameters, name string) (string,
 	return value, nil
 }
 
+// TODO: refactor this copy of psiphon/server.getStringArrayRequestParam into common?
+func getStringArrayRequestParam(
+	apiParams common.APIParameters, name string) ([]string, error) {
+
+	if apiParams[name] == nil {
+		return nil, errors.Tracef("missing param: %s", name)
+	}
+
+	switch value := apiParams[name].(type) {
+	case []string:
+		return value, nil
+	case []interface{}:
+		result := make([]string, len(value))
+		for i, item := range value {
+			stringValue, ok := item.(string)
+			if !ok {
+				return nil, errors.Tracef("invalid param: %s", name)
+			}
+			result[i] = stringValue
+		}
+		return result, nil
+	default:
+		return nil, errors.Tracef("invalid param: %s", name)
+	}
+}
+
 // TODO: refactor this copy of psiphon/server.getIntStringRequestParam into common?
 func getIntStringRequestParam(params common.APIParameters, name string) (int, error) {
 	if params[name] == nil {
@@ -1121,7 +1182,7 @@ func getIntStringRequestParam(params common.APIParameters, name string) (int, er
 		return 0, errors.Tracef("invalid param: %s", name)
 	}
 	value, err := strconv.Atoi(valueStr)
-	if !ok {
+	if err != nil {
 		return 0, errors.Trace(err)
 	}
 	return value, nil
@@ -1505,10 +1566,6 @@ func HandleTacticsPayload(
 	//   reload on the server
 	// - old and new tactics should both be valid
 
-	if payload == nil {
-		return nil, errors.TraceNew("unexpected nil payload")
-	}
-
 	record, err := getStoredTacticsRecord(storer, networkID)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -1880,6 +1937,10 @@ func applyTacticsPayload(
 	payload *Payload) (bool, error) {
 
 	newTactics := false
+
+	if payload == nil {
+		return newTactics, errors.TraceNew("unexpected nil payload")
+	}
 
 	if payload.Tag == "" {
 		return newTactics, errors.TraceNew("invalid tag")

@@ -20,10 +20,14 @@
 package common
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestWriteRuntimeProfiles(t *testing.T) {
@@ -35,7 +39,146 @@ func TestWriteRuntimeProfiles(t *testing.T) {
 	}
 	defer os.RemoveAll(testDirName)
 
+	before := time.Now()
 	WriteRuntimeProfiles(&testLogger{}, testDirName, "suffix", 1, 1)
+
+	// The manifest is written last and lists every profile written, by base
+	// name, so a collector knows the collection is complete and what to ship.
+	content, err := os.ReadFile(filepath.Join(testDirName, profileManifestName))
+	if err != nil {
+		t.Fatalf("read manifest: %s", err)
+	}
+	var manifest profileManifest
+	if err := json.Unmarshal(content, &manifest); err != nil {
+		t.Fatalf("parse manifest: %s", err)
+	}
+	if manifest.CompletedAt.Before(before) {
+		t.Fatalf("manifest completed_at %s precedes the run", manifest.CompletedAt)
+	}
+	listed := make(map[string]bool)
+	for _, name := range manifest.Files {
+		listed[name] = true
+		if _, err := os.Stat(filepath.Join(testDirName, name)); err != nil {
+			t.Fatalf("manifest lists %s, which is missing: %s", name, err)
+		}
+	}
+	for _, name := range []string{"goroutine", "heap", "threadcreate", "cpu", "block", "mutex"} {
+		if !listed[name+".profile.suffix"] {
+			t.Fatalf("manifest %v does not list %s.profile.suffix", manifest.Files, name)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(testDirName, profileManifestName+".tmp")); !os.IsNotExist(err) {
+		t.Fatalf("temporary manifest left behind: %v", err)
+	}
+}
+
+// The protocol buffer variant writes every profile gzip-compressed (the
+// runtime's protocol buffer encoding), listed in the manifest like the text
+// ones; the text variant leaves the non-CPU profiles as readable text.
+func TestWriteRuntimeProfilesProtobuf(t *testing.T) {
+
+	testDirName, err := ioutil.TempDir("", "psiphon-profiles-test")
+	if err != nil {
+		fmt.Printf("TempDir failed: %s\n", err)
+		os.Exit(1)
+	}
+	defer os.RemoveAll(testDirName)
+
+	WriteRuntimeProfilesProtobuf(&testLogger{}, testDirName, "", 1, 1)
+
+	content, err := os.ReadFile(filepath.Join(testDirName, profileManifestName))
+	if err != nil {
+		t.Fatalf("read manifest: %s", err)
+	}
+	var manifest profileManifest
+	if err := json.Unmarshal(content, &manifest); err != nil {
+		t.Fatalf("parse manifest: %s", err)
+	}
+	if len(manifest.Files) != 6 {
+		t.Fatalf("manifest lists %v, want the six profiles", manifest.Files)
+	}
+	for _, name := range manifest.Files {
+		head := make([]byte, 2)
+		file, err := os.Open(filepath.Join(testDirName, name))
+		if err != nil {
+			t.Fatalf("open %s: %s", name, err)
+		}
+		_, err = file.Read(head)
+		file.Close()
+		if err != nil {
+			t.Fatalf("read %s: %s", name, err)
+		}
+		if head[0] != 0x1f || head[1] != 0x8b {
+			t.Fatalf("%s is not gzip-compressed (starts %x)", name, head)
+		}
+	}
+
+	textDirName, err := ioutil.TempDir("", "psiphon-profiles-test")
+	if err != nil {
+		fmt.Printf("TempDir failed: %s\n", err)
+		os.Exit(1)
+	}
+	defer os.RemoveAll(textDirName)
+
+	WriteRuntimeProfiles(&testLogger{}, textDirName, "", 0, 0)
+
+	text, err := os.ReadFile(filepath.Join(textDirName, "goroutine.profile"))
+	if err != nil {
+		t.Fatalf("read text goroutine profile: %s", err)
+	}
+	if !bytes.HasPrefix(text, []byte("goroutine profile: total ")) {
+		t.Fatalf("text goroutine profile starts %q, want the legacy text header", text[:min(len(text), 30)])
+	}
+}
+
+func TestWriteRuntimeProfilesCreatesDirectory(t *testing.T) {
+
+	testDirName, err := ioutil.TempDir("", "psiphon-profiles-test")
+	if err != nil {
+		fmt.Printf("TempDir failed: %s\n", err)
+		os.Exit(1)
+	}
+	defer os.RemoveAll(testDirName)
+
+	// The output directory, and its parent, do not exist yet.
+	outputDirectory := filepath.Join(testDirName, "missing", "profiles")
+
+	WriteRuntimeProfiles(&testLogger{}, outputDirectory, "", 0, 0)
+
+	for _, name := range []string{"goroutine.profile", "heap.profile", "threadcreate.profile", profileManifestName} {
+		if _, err := os.Stat(filepath.Join(outputDirectory, name)); err != nil {
+			t.Fatalf("%s not written into the created directory: %s", name, err)
+		}
+	}
+}
+
+func TestWriteRuntimeProfilesNoManifestWithoutProfiles(t *testing.T) {
+
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+
+	testDirName, err := ioutil.TempDir("", "psiphon-profiles-test")
+	if err != nil {
+		fmt.Printf("TempDir failed: %s\n", err)
+		os.Exit(1)
+	}
+	defer os.RemoveAll(testDirName)
+
+	// A read-only output directory: every profile open fails, so nothing is
+	// collected and no manifest may claim otherwise.
+	if err := os.Chmod(testDirName, 0555); err != nil {
+		t.Fatalf("chmod: %s", err)
+	}
+	defer os.Chmod(testDirName, 0755)
+
+	WriteRuntimeProfiles(&tolerantTestLogger{}, testDirName, "", 0, 0)
+
+	for _, name := range []string{profileManifestName, profileManifestName + ".tmp"} {
+		if _, err := os.Stat(filepath.Join(testDirName, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s written for a collection with no profiles: %v", name, err)
+		}
+	}
 }
 
 type testLogger struct {
@@ -72,4 +215,28 @@ func (logger *testLoggerTrace) Warning(args ...interface{}) {
 
 func (logger *testLoggerTrace) Error(args ...interface{}) {
 	panic("unexpected log call")
+}
+
+// tolerantTestLogger is a testLogger whose trace logs accept errors, for the
+// tests that provoke expected failures.
+type tolerantTestLogger struct {
+	testLogger
+}
+
+func (logger *tolerantTestLogger) WithTrace() LogTrace {
+	return &tolerantTestLoggerTrace{}
+}
+
+func (logger *tolerantTestLogger) WithTraceFields(fields LogFields) LogTrace {
+	return &tolerantTestLoggerTrace{}
+}
+
+type tolerantTestLoggerTrace struct {
+	testLoggerTrace
+}
+
+func (logger *tolerantTestLoggerTrace) Warning(args ...interface{}) {
+}
+
+func (logger *tolerantTestLoggerTrace) Error(args ...interface{}) {
 }

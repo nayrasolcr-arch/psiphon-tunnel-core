@@ -256,10 +256,15 @@ type WebRTCDialCoordinator interface {
 	// obfuscation/replay on both sides.
 	ClientRootObfuscationSecret() ObfuscationSecret
 
-	// DTLSFingerprint returns the selected DTLS fingerprint name. New
+	// ClientDTLSFingerprint returns the selected DTLS fingerprint name. New
 	// clients always select a fingerprint (Randomized, Chrome, Firefox,
 	// etc.).
-	DTLSFingerprint() string
+	ClientDTLSFingerprint() string
+
+	// ProxyDTLSFingerprint deterministically selects a DTLS fingerprint
+	// name from the specified client root obfuscation secret.
+	ProxyDTLSFingerprint(
+		ClientRootObfuscationSecret ObfuscationSecret) (string, error)
 
 	// UseMediaStreams indicates whether to use WebRTC media streams to tunnel
 	// traffic. When false, a WebRTC data channel is used to tunnel traffic.
@@ -380,6 +385,21 @@ type WebRTCDialCoordinator interface {
 	// operation is required, BindToDevice should take no action and return
 	// nil.
 	BindToDevice(fileDescriptor int) error
+
+	// BindToDeviceInterfaceName returns the name of the network interface
+	// that BindToDevice binds sockets to, or "" when BindToDevice does not
+	// target a specific named interface -- for example, when there is no
+	// split-interface configuration, or on platforms that bind to an
+	// underlying network rather than a named interface (such as Android
+	// VpnService.protect).
+	//
+	// It is used to target port mapping (UPnP/NAT-PMP/PCP) gateway discovery
+	// at the same interface the port mapping sockets are bound to. In a
+	// split-interface in-proxy proxy, that is the downstream interface;
+	// probing the default-route gateway instead could target the wrong
+	// router and make port mapping discovery fail. When "" is returned, the
+	// system default route is used.
+	BindToDeviceInterfaceName() string
 
 	// ProxyUpstreamDial is used by the proxy when dialing a TCP or UDP
 	// upstream connection to a destination Psiphon server. This dial

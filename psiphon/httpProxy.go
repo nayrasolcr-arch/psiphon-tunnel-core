@@ -101,13 +101,22 @@ func NewHttpProxy(
 	tunneler Tunneler,
 	listenIP string) (proxy *HttpProxy, err error) {
 
-	listener, portInUse, err := makeLocalProxyListener(
-		listenIP, config.LocalHttpProxyPort)
-	if err != nil {
-		if portInUse {
-			NoticeHttpProxyPortInUse(config.LocalHttpProxyPort)
+	var listener net.Listener
+	if config.UseUnixDomainSockets {
+		listener, err = makeLocalProxyUnixListener(config.LocalHttpProxyUnixPath)
+		if err != nil {
+			return nil, errors.Trace(err)
 		}
-		return nil, errors.Trace(err)
+	} else {
+		var portInUse bool
+		listener, portInUse, err = makeLocalProxyListener(
+			listenIP, config.LocalHttpProxyPort)
+		if err != nil {
+			if portInUse {
+				NoticeHttpProxyPortInUse(config.LocalHttpProxyPort)
+			}
+			return nil, errors.Trace(err)
+		}
 	}
 
 	tunneledDialer := func(_, addr string) (conn net.Conn, err error) {
@@ -160,8 +169,16 @@ func NewHttpProxy(
 		Jar:       nil,
 	}
 
-	proxyIP, proxyPortString, _ := net.SplitHostPort(listener.Addr().String())
-	proxyPort, _ := strconv.Atoi(proxyPortString)
+	// In Unix domain socket mode there is no IP:port; listenIP/listenPort are
+	// left as zero values. The URL proxy M3U8 rewrite, which depends on an
+	// IP:port to construct rewritten URLs, is not supported in this mode.
+	var proxyIP string
+	var proxyPort int
+	if !config.UseUnixDomainSockets {
+		var proxyPortString string
+		proxyIP, proxyPortString, _ = net.SplitHostPort(listener.Addr().String())
+		proxyPort, _ = strconv.Atoi(proxyPortString)
+	}
 
 	proxy = &HttpProxy{
 		config:                 config,
@@ -193,7 +210,11 @@ func NewHttpProxy(
 	// NoticeListeningHttpProxyPort after that call.
 	// Also, check the listen backlog queue length -- shouldn't it be possible
 	// to enqueue pending connections between net.Listen() and httpServer.Serve()?
-	NoticeListeningHttpProxyPort(proxy.listenPort)
+	if config.UseUnixDomainSockets {
+		NoticeListeningHttpProxyUnixPath(config.LocalHttpProxyUnixPath)
+	} else {
+		NoticeListeningHttpProxyPort(proxy.listenPort)
+	}
 
 	return proxy, nil
 }
@@ -388,24 +409,22 @@ func (conn *rewriteICYConn) Read(b []byte) (int, error) {
 		return conn.Conn.Read(b)
 	}
 
-	if len(b) < 3 {
-		// Don't attempt to rewrite the protocol when insufficient
-		// buffer space. This is not expected to happen in practise
-		// when Go's http reads the response, so for now we just
-		// skip the rewrite instead of tracking state accross Reads.
-		return conn.Conn.Read(b)
+	protocol := "HTTP/1.0"
+	if len(b) < len(protocol) {
+		// Rewriting "ICY" expands the protocol name. Fail for unrealistically
+		// short buffer sizes rather than track replacement bytes across Read calls.
+		return 0, io.ErrShortBuffer
 	}
 
 	// Expect to read either "ICY" or "HTT".
 
-	n, err := conn.Conn.Read(b[:3])
+	n, err := io.ReadFull(conn.Conn, b[:3])
 	if err != nil {
 		return n, err
 	}
 
 	if bytes.Equal(b[:3], []byte("ICY")) {
 		atomic.StoreInt32(conn.isICY, 1)
-		protocol := "HTTP/1.0"
 		copy(b, []byte(protocol))
 		return len(protocol), nil
 	}
@@ -548,7 +567,9 @@ func (proxy *HttpProxy) relayHTTPRequest(
 
 		switch key {
 		case "m3u8":
-			err = rewriteM3U8(proxy.listenIP, proxy.listenPort, response)
+			err = rewriteM3U8(
+				proxy.config.UseUnixDomainSockets,
+				proxy.listenIP, proxy.listenPort, response)
 		}
 
 		if err != nil {
@@ -763,7 +784,15 @@ func proxifyURL(localHTTPProxyIP string, localHTTPProxyPort int, urlString strin
 
 // Rewrite the contents of the M3U8 file in body to be compatible with URL proxying.
 // If error is returned, response body may not be valid for reading.
-func rewriteM3U8(localHTTPProxyIP string, localHTTPProxyPort int, response *http.Response) error {
+//
+// M3U8 rewriting is not supported when the local HTTP proxy is listening on a
+// Unix domain socket, as the rewritten segment URLs require an IP:port to
+// address the local proxy.
+func rewriteM3U8(useUnixDomainSockets bool, localHTTPProxyIP string, localHTTPProxyPort int, response *http.Response) error {
+	if useUnixDomainSockets {
+		return errors.TraceNew("M3U8 rewriting is not supported with Unix domain sockets")
+	}
+
 	// Check URL path extension
 	extension := filepath.Ext(response.Request.URL.Path)
 	var shouldHandle = (extension == ".m3u8")

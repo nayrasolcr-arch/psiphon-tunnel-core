@@ -19,14 +19,14 @@
 
 // Package psinet implements psinet database services. The psinet database is a
 // JSON-format file containing information about the Psiphon network, including
-// sponsors, home pages, stats regexes, available upgrades, and other servers for
+// sponsors, home pages, available upgrades, and other servers for
 // discovery.
 package psinet
 
 import (
-	"crypto/md5"
 	"encoding/json"
 	"math/rand"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -76,13 +76,10 @@ func (s *DiscoveryServer) String() string {
 }
 
 type Sponsor struct {
-	ID                  string                `json:"id"`
-	HomePages           map[string][]HomePage `json:"home_pages"`
-	MobileHomePages     map[string][]HomePage `json:"mobile_home_pages"`
-	AlertActionURLs     map[string][]string   `json:"alert_action_urls"`
-	HttpsRequestRegexes []HttpsRequestRegex   `json:"https_request_regexes"`
-
-	domainBytesChecksum []byte `json:"-"`
+	ID              string                `json:"id"`
+	HomePages       map[string][]HomePage `json:"home_pages"`
+	MobileHomePages map[string][]HomePage `json:"mobile_home_pages"`
+	AlertActionURLs map[string][]string   `json:"alert_action_urls"`
 }
 
 type ClientVersion struct {
@@ -92,11 +89,6 @@ type ClientVersion struct {
 type HomePage struct {
 	Region string `json:"region"`
 	URL    string `json:"url"`
-}
-
-type HttpsRequestRegex struct {
-	Regex   string `json:"regex"`
-	Replace string `json:"replace"`
 }
 
 // NewDatabase initializes a Database, calling Reload on the specified
@@ -123,19 +115,6 @@ func NewDatabase(filename string) (*Database, error) {
 			database.ValidServerEntryTags = newDatabase.ValidServerEntryTags
 			database.DiscoveryServers = newDatabase.DiscoveryServers
 			database.fileModTime = fileModTime
-
-			for _, sponsor := range database.Sponsors {
-
-				value, err := json.Marshal(sponsor.HttpsRequestRegexes)
-				if err != nil {
-					return errors.Trace(err)
-				}
-
-				// MD5 hash is used solely as a data checksum and not for any
-				// security purpose.
-				checksum := md5.Sum(value)
-				sponsor.domainBytesChecksum = checksum[:]
-			}
 
 			// Decode each encoded server entry for its IP address, which is used in
 			// the consistent.Member implementation in the discovery package.
@@ -177,9 +156,13 @@ func NewDatabase(filename string) (*Database, error) {
 // GetRandomizedHomepages returns a randomly ordered list of home pages
 // for the specified sponsor, region, and platform.
 func (db *Database) GetRandomizedHomepages(
-	sponsorID, clientRegion, clientASN, deviceRegion string, isMobilePlatform bool) []string {
+	sponsorID, clientRegion, clientASN, deviceRegion, normalizedClientPlatform string,
+	isMobilePlatform bool,
+	clientFeatureValues map[string]string) []string {
 
-	homepages := db.GetHomepages(sponsorID, clientRegion, clientASN, deviceRegion, isMobilePlatform)
+	homepages := db.GetHomepages(
+		sponsorID, clientRegion, clientASN, deviceRegion, normalizedClientPlatform,
+		isMobilePlatform, clientFeatureValues)
 	if len(homepages) > 1 {
 		shuffledHomepages := make([]string, len(homepages))
 		perm := rand.Perm(len(homepages))
@@ -194,7 +177,9 @@ func (db *Database) GetRandomizedHomepages(
 // GetHomepages returns a list of home pages for the specified sponsor,
 // region, and platform.
 func (db *Database) GetHomepages(
-	sponsorID, clientRegion, clientASN, deviceRegion string, isMobilePlatform bool) []string {
+	sponsorID, clientRegion, clientASN, deviceRegion, normalizedClientPlatform string,
+	isMobilePlatform bool,
+	clientFeatureValues map[string]string) []string {
 
 	db.ReloadableFile.RLock()
 	defer db.ReloadableFile.RUnlock()
@@ -226,9 +211,11 @@ func (db *Database) GetHomepages(
 	homePagesByRegion, ok := homePages[clientRegion]
 	if ok {
 		for _, homePage := range homePagesByRegion {
+			homepageURL := homepageQueryParameterSubstitution(
+				homePage.URL, clientRegion, clientASN, deviceRegion,
+				normalizedClientPlatform, clientFeatureValues)
 			sponsorHomePages = append(
-				sponsorHomePages, homepageQueryParameterSubstitution(
-					homePage.URL, clientRegion, clientASN, deviceRegion))
+				sponsorHomePages, homepageURL)
 		}
 	}
 
@@ -237,10 +224,11 @@ func (db *Database) GetHomepages(
 		defaultHomePages, ok := homePages["None"]
 		if ok {
 			for _, homePage := range defaultHomePages {
-				// client_region query parameter substitution
+				homepageURL := homepageQueryParameterSubstitution(
+					homePage.URL, clientRegion, clientASN, deviceRegion,
+					normalizedClientPlatform, clientFeatureValues)
 				sponsorHomePages = append(
-					sponsorHomePages, homepageQueryParameterSubstitution(
-						homePage.URL, clientRegion, clientASN, deviceRegion))
+					sponsorHomePages, homepageURL)
 			}
 		}
 	}
@@ -249,18 +237,66 @@ func (db *Database) GetHomepages(
 }
 
 func homepageQueryParameterSubstitution(
-	url, clientRegion, clientASN, deviceRegion string) string {
+	homepageURL, clientRegion, clientASN, deviceRegion, normalizedClientPlatform string,
+	clientFeatureValues map[string]string) string {
 
-	url = strings.Replace(url, "client_region=XX", "client_region="+clientRegion, 1)
-	url = strings.Replace(url, "client_asn=XX", "client_asn="+clientASN, 1)
-	url = strings.Replace(url, "device_region=XX", "device_region="+deviceRegion, 1)
-	return url
+	// Substitute <key>=XX templates in the URL query component, splitting
+	// on "?", "&", and "#", ensuring exact key match and no substring
+	// conflicts.
+	//
+	// Template keys and the XX value are assumed to be unencoded.
+	//
+	// Built-in parameters take precedence over any clientFeatureValues
+	// parameter with the same name. Any <key>=XX placeholder that doesn't
+	// match a built-in or clientFeatureValues query parameter is left
+	// unsubstituted.
+	//
+	// url.QueryEscape guards against URL injection from untrusted inputs.
+
+	urlWithoutFragment, fragment, hasFragment := strings.Cut(homepageURL, "#")
+	base, query, ok := strings.Cut(urlWithoutFragment, "?")
+	if !ok {
+		return homepageURL
+	}
+
+	components := strings.Split(query, "&")
+	for i, component := range components {
+		key, ok := strings.CutSuffix(component, "=XX")
+		if !ok {
+			continue
+		}
+		var value string
+		switch key {
+		case "client_region":
+			value = clientRegion
+		case "client_asn":
+			value = clientASN
+		case "device_region":
+			value = deviceRegion
+		case "client_platform":
+			value = strings.ToLower(normalizedClientPlatform)
+		default:
+			value, ok = clientFeatureValues[key]
+			if !ok {
+				continue
+			}
+		}
+		components[i] = key + "=" + url.QueryEscape(value)
+	}
+
+	homepageURL = base + "?" + strings.Join(components, "&")
+	if hasFragment {
+		homepageURL += "#" + fragment
+	}
+
+	return homepageURL
 }
 
 // GetAlertActionURLs returns a list of alert action URLs for the specified
 // alert reason and sponsor.
 func (db *Database) GetAlertActionURLs(
-	alertReason, sponsorID, clientRegion, clientASN, deviceRegion string) []string {
+	alertReason, sponsorID, clientRegion, clientASN, deviceRegion, normalizedClientPlatform string,
+	clientFeatureValues map[string]string) []string {
 
 	db.ReloadableFile.RLock()
 	defer db.ReloadableFile.RUnlock()
@@ -273,17 +309,21 @@ func (db *Database) GetAlertActionURLs(
 	sponsor := db.Sponsors[sponsorID]
 	if sponsor != nil {
 		for _, URL := range sponsor.AlertActionURLs[alertReason] {
+			URL = homepageQueryParameterSubstitution(
+				URL, clientRegion, clientASN, deviceRegion,
+				normalizedClientPlatform, clientFeatureValues)
 			actionURLs = append(
-				actionURLs, homepageQueryParameterSubstitution(
-					URL, clientRegion, clientASN, deviceRegion))
+				actionURLs, URL)
 		}
 	}
 
 	if len(actionURLs) == 0 {
 		for _, URL := range db.DefaultAlertActionURLs[alertReason] {
+			URL = homepageQueryParameterSubstitution(
+				URL, clientRegion, clientASN, deviceRegion,
+				normalizedClientPlatform, clientFeatureValues)
 			actionURLs = append(
-				actionURLs, homepageQueryParameterSubstitution(
-					URL, clientRegion, clientASN, deviceRegion))
+				actionURLs, URL)
 		}
 	}
 
@@ -326,53 +366,6 @@ func (db *Database) GetUpgradeClientVersion(clientVersion, clientPlatform string
 	}
 
 	return ""
-}
-
-// GetHttpsRequestRegexes returns bytes transferred stats regexes and the
-// associated checksum for the specified sponsor. The checksum may be nil.
-func (db *Database) GetHttpsRequestRegexes(sponsorID string) ([]map[string]string, []byte) {
-	db.ReloadableFile.RLock()
-	defer db.ReloadableFile.RUnlock()
-
-	regexes := make([]map[string]string, 0)
-
-	sponsor, ok := db.Sponsors[sponsorID]
-	if !ok {
-		sponsor = db.Sponsors[db.DefaultSponsorID]
-	}
-
-	if sponsor == nil {
-		return regexes, nil
-	}
-
-	// If neither sponsorID or DefaultSponsorID were found, sponsor will be the
-	// zero value of the map, an empty Sponsor struct.
-	for _, sponsorRegex := range sponsor.HttpsRequestRegexes {
-		regex := make(map[string]string)
-		regex["replace"] = sponsorRegex.Replace
-		regex["regex"] = sponsorRegex.Regex
-		regexes = append(regexes, regex)
-	}
-
-	return regexes, sponsor.domainBytesChecksum
-}
-
-// GetDomainBytesChecksum returns the bytes transferred stats regexes
-// checksum for the specified sponsor. The checksum may be nil.
-func (db *Database) GetDomainBytesChecksum(sponsorID string) []byte {
-	db.ReloadableFile.RLock()
-	defer db.ReloadableFile.RUnlock()
-
-	sponsor, ok := db.Sponsors[sponsorID]
-	if !ok {
-		sponsor = db.Sponsors[db.DefaultSponsorID]
-	}
-
-	if sponsor == nil {
-		return nil
-	}
-
-	return sponsor.domainBytesChecksum
 }
 
 // IsValidServerEntryTag checks if the specified server entry tag is valid.

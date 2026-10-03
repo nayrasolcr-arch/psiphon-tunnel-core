@@ -69,6 +69,28 @@ func GenerateRootObfuscationSecret() (ObfuscationSecret, error) {
 	return secret, nil
 }
 
+// DeriveDTLSFingerprintPRNG derives a replayable PRNG for WebRTC DTLS
+// fingerprint selection, using the ClientRootObfuscationSecret, with
+// distinct values for offer and answer contexts.
+func DeriveDTLSFingerprintPRNG(
+	clientRootObfuscationSecret ObfuscationSecret, isOffer bool) (*prng.PRNG, error) {
+
+	context := "in-proxy-DTLS-fingerprint-offer"
+	if !isOffer {
+		context = "in-proxy-DTLS-fingerprint-answer"
+	}
+
+	obfuscationSecret, err := deriveObfuscationSecret(
+		clientRootObfuscationSecret, context)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	seed := prng.Seed(obfuscationSecret)
+
+	return prng.NewPRNGWithSeed(&seed), nil
+}
+
 // antiReplayTimeFactorPeriodSeconds is variable, to enable overriding the value in
 // tests. This value should not be overridden outside of test
 // cases.
@@ -294,7 +316,7 @@ func deobfuscateSessionPacket(
 	timestamp := int64(0)
 	if replayHistory != nil {
 		timestamp, n = binary.Varint(plaintext[offset:])
-		if timestamp == 0 && n <= 0 {
+		if timestamp == 0 || n <= 0 {
 			return nil, NewDeobfuscationAnomoly(
 				errors.TraceNew("invalid timestamp"))
 		}
@@ -306,7 +328,7 @@ func deobfuscateSessionPacket(
 			errors.TraceNew("invalid padding size"))
 	}
 	offset += n
-	if len(plaintext[offset:]) < int(paddingSize) {
+	if paddingSize > uint64(len(plaintext[offset:])) {
 		return nil, NewDeobfuscationAnomoly(
 			errors.TraceNew("invalid padding"))
 	}

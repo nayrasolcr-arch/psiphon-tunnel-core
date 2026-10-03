@@ -31,6 +31,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,6 +50,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/proxyheader"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/quic"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/refraction"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/stacktrace"
@@ -79,6 +81,8 @@ const (
 	ALERT_REQUEST_QUEUE_BUFFER_SIZE       = 16
 	SSH_MAX_CLIENT_COUNT                  = 500000
 	SSH_CLIENT_MAX_DSL_REQUEST_COUNT      = 128
+	SSH_CLIENT_MAX_REQUEST_FAIL_LOG_COUNT = 16
+	SSH_CLIENT_MAX_BLOCKLIST_HIT_LOGS     = 1024
 )
 
 // TunnelServer is the main server that accepts Psiphon client
@@ -427,6 +431,8 @@ type sshServer struct {
 	sshHostKey              ssh.Signer
 	obfuscatorSeedHistory   *obfuscator.SeedHistory
 	inproxyBrokerSessions   *inproxy.ServerBrokerSessions
+
+	homepageURLQueryParameterClientFeatures atomic.Pointer[homepageURLQueryParameterClientFeatureLookup]
 
 	clientsMutex         sync.Mutex
 	stoppingClients      bool
@@ -904,10 +910,6 @@ func runListener(
 			if e, ok := err.(net.Error); ok && e.Temporary() {
 				log.WithTraceFields(LogFields{"error": err}).Error("accept failed")
 				// Temporary error, keep running
-				continue
-			} else if std_errors.Is(err, errRestrictedProvider) {
-				log.WithTraceFields(LogFields{"error": err}).Error("accept rejected client")
-				// Restricted provider, keep running
 				continue
 			}
 
@@ -1573,6 +1575,7 @@ func (sshServer *sshServer) reloadTactics() error {
 
 			var brokerPublicKeys []inproxy.SessionPublicKey
 			var brokerRootObfuscationSecrets []inproxy.ObfuscationSecret
+			var brokerSpecHashes [][]byte
 
 			for _, brokerSpec := range brokerSpecs {
 
@@ -1593,6 +1596,12 @@ func (sshServer *sshServer) reloadTactics() error {
 
 				brokerRootObfuscationSecrets = append(
 					brokerRootObfuscationSecrets, brokerRootObfuscationSecret)
+
+				brokerSpecHash, err := brokerSpec.Hash()
+				if err != nil {
+					return errors.Trace(err)
+				}
+				brokerSpecHashes = append(brokerSpecHashes, brokerSpecHash)
 			}
 
 			// SetKnownBrokerPublicKeys will terminate any existing sessions
@@ -1600,7 +1609,7 @@ func (sshServer *sshServer) reloadTactics() error {
 			// but will retain any existing sessions for broker public keys
 			// that remain in the list.
 			err = sshServer.inproxyBrokerSessions.SetKnownBrokers(
-				brokerPublicKeys, brokerRootObfuscationSecrets)
+				brokerPublicKeys, brokerRootObfuscationSecrets, brokerSpecHashes)
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -1618,7 +1627,118 @@ func (sshServer *sshServer) reloadTactics() error {
 		return errors.Trace(err)
 	}
 
+	err = sshServer.reloadHomepageURLQueryParameterClientFeatures()
+	if err != nil {
+		return errors.Trace(err)
+	}
+
 	return nil
+}
+
+type homepageURLQueryParameterClientFeatureLookup struct {
+	queryParameters               []string
+	queryParameterByClientFeature common.StringValueLookup[string]
+}
+
+func (sshServer *sshServer) reloadHomepageURLQueryParameterClientFeatures() error {
+
+	// Assumes no GeoIP targeting for HomepageURLQueryParameterClientFeatures.
+
+	p, err := sshServer.support.ServerTacticsParametersCache.Get(NewGeoIPData())
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	if p.IsNil() {
+		sshServer.homepageURLQueryParameterClientFeatures.Store(
+			&homepageURLQueryParameterClientFeatureLookup{})
+		return nil
+	}
+
+	configuration := p.KeyStringsValue(parameters.HomepageURLQueryParameterClientFeatures)
+
+	queryParameters := make([]string, 0, len(configuration))
+	clientFeatures := make([]string, 0)
+	queryParametersByClientFeature := make([]string, 0)
+	seenClientFeatures := make(map[string]struct{})
+
+	for queryParameter, candidates := range configuration {
+		if queryParameter == "" {
+			return errors.TraceNew("empty query parameter")
+		}
+
+		if url.QueryEscape(queryParameter) != queryParameter {
+			return errors.Tracef(
+				"query parameter requires URL encoding: %s", queryParameter)
+		}
+
+		queryParameters = append(queryParameters, queryParameter)
+
+		for _, clientFeature := range candidates {
+			if clientFeature == "" {
+				return errors.Tracef(
+					"empty client feature for query parameter: %s",
+					queryParameter)
+			}
+
+			if _, ok := seenClientFeatures[clientFeature]; ok {
+				return errors.Tracef(
+					"duplicate client feature: %s", clientFeature)
+			}
+
+			seenClientFeatures[clientFeature] = struct{}{}
+			clientFeatures = append(clientFeatures, clientFeature)
+			queryParametersByClientFeature = append(
+				queryParametersByClientFeature, queryParameter)
+		}
+	}
+
+	clientFeatureLookup, err := common.NewStringValueLookup(
+		clientFeatures, queryParametersByClientFeature)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	lookup := &homepageURLQueryParameterClientFeatureLookup{
+		queryParameters:               queryParameters,
+		queryParameterByClientFeature: clientFeatureLookup,
+	}
+
+	sshServer.homepageURLQueryParameterClientFeatures.Store(lookup)
+
+	return nil
+}
+
+func (sshServer *sshServer) selectHomepageURLQueryParameterClientFeatures(
+	clientFeatures []string) map[string]string {
+
+	lookup := sshServer.homepageURLQueryParameterClientFeatures.Load()
+	if lookup == nil {
+		return nil
+	}
+
+	clientFeatureValues := make(
+		map[string]string, len(lookup.queryParameters))
+
+	// Supply the value "" for any configured client feature query parameter
+	// with no corresponding value found in the client input.
+	for _, queryParameter := range lookup.queryParameters {
+		clientFeatureValues[queryParameter] = ""
+	}
+
+	for _, clientFeature := range clientFeatures {
+		queryParameter, ok :=
+			lookup.queryParameterByClientFeature.Get(clientFeature)
+		if !ok {
+			continue
+		}
+
+		// Later qualifying client features replace earlier values for the
+		// same query parameter.
+		clientFeatureValues[queryParameter] = clientFeature
+	}
+
+	return clientFeatureValues
 }
 
 func (sshServer *sshServer) revokeClientAuthorizations(sessionID string) {
@@ -1980,7 +2100,16 @@ type sshClient struct {
 	invalidServerEntryTags               int
 	sshProtocolBytesTracker              *sshProtocolBytesTracker
 	dslRequestCount                      int
+	lastConnectedRequestTime             time.Time
+	lastConnectedTimestamp               string
+	unacceptedConnectedRequestLogged     bool
+	persistentStatsLogCount              int
+	persistentStatsDroppedLogCount       int
+	blocklistHitsLogCount                int
 	proxyProtocolMetrics                 proxyProtocolMetrics
+
+	clientEvents           []string
+	lightProxyClientEvents []string
 }
 
 type trafficState struct {
@@ -1991,6 +2120,7 @@ type trafficState struct {
 	concurrentPortForwardCount            int64
 	peakConcurrentPortForwardCount        int64
 	totalPortForwardCount                 int64
+	totalDomainPortForwardCount           int64
 	availablePortForwardCond              *sync.Cond
 }
 
@@ -2103,10 +2233,10 @@ type handshakeState struct {
 	completed                 bool
 	apiProtocol               string
 	apiParams                 common.APIParameters
+	clientFeatures            []string
 	activeAuthorizationIDs    []string
 	authorizedAccessTypes     []string
 	authorizationsRevoked     bool
-	domainBytesChecksum       []byte
 	establishedTunnelsCount   int
 	splitTunnelLookup         *common.StringLookup
 	deviceRegion              string
@@ -2121,6 +2251,7 @@ type handshakeState struct {
 
 type proxyProtocolHeaderConfig struct {
 	macKey                     []byte
+	customTLV                  []byte
 	targetDestinationAddresses common.StringLookup
 }
 
@@ -2591,14 +2722,15 @@ func (sshClient *sshClient) run(
 		var err error
 
 		if protocol.TunnelProtocolUsesObfuscatedSSH(sshClient.tunnelProtocol) {
-			// With Encrypt-then-MAC hash algorithms, packet length is
-			// transmitted in plaintext, which aids in traffic analysis;
-			// clients may still send Encrypt-then-MAC algorithms in their
-			// KEX_INIT message, but do not select these algorithms.
+			// Ensure SSH algorithm selection conforms to the obfuscated SSH
+			// expectation that everything after the obfuscated KEX is fully
+			// random. Full compliance depends on clients with the latest
+			// ObfuscatedSSHMode logic; for legacy client compatibility, the
+			// server allows non-conforming selections.
 			//
 			// The exception is TUNNEL_PROTOCOL_SSH, which is intended to appear
 			// like SSH on the wire.
-			sshServerConfig.NoEncryptThenMACHash = true
+			sshServerConfig.ObfuscatedSSHMode = true
 
 		} else {
 			// For TUNNEL_PROTOCOL_SSH only, randomize KEX.
@@ -3118,6 +3250,8 @@ func (sshClient *sshClient) runTunnel(
 
 func (sshClient *sshClient) handleSSHRequests(requests <-chan *ssh.Request) {
 
+	requestFailureCount := 0
+
 	for request := range requests {
 
 		// Requests are processed serially; API responses must be sent in request order.
@@ -3145,7 +3279,19 @@ func (sshClient *sshClient) handleSSHRequests(requests <-chan *ssh.Request) {
 		if err == nil {
 			err = request.Reply(true, responsePayload)
 		} else {
-			log.WithTraceFields(LogFields{"error": err}).Warning("request failed")
+			// Logging for errRestrictedProvider is already handled in setHandshakeState,
+			// where it's logged only at debug level as it's an expected event; so this
+			// is also not counted towards requestFailureCount.
+			if !std_errors.Is(err, errRestrictedProvider) {
+				requestFailureCount++
+				if requestFailureCount < SSH_CLIENT_MAX_REQUEST_FAIL_LOG_COUNT {
+					log.WithTraceFields(LogFields{"error": err}).Warning(
+						"request failed")
+				} else if requestFailureCount == SSH_CLIENT_MAX_REQUEST_FAIL_LOG_COUNT {
+					log.WithTraceFields(LogFields{"error": err}).Warning(
+						"request failure log limit exceeded")
+				}
+			}
 			err = request.Reply(false, nil)
 		}
 		if err != nil {
@@ -3543,6 +3689,12 @@ func (sshClient *sshClient) handleNewTCPPortForwardChannel(
 
 	if isUdpgwChannel {
 
+		completed, _ := sshClient.getHandshaked()
+		if !completed {
+			sshClient.rejectNewChannel(newChannel, "port forward not permitted")
+			return
+		}
+
 		// Dispatch immediately. handleUDPChannel runs the udpgw protocol in its
 		// own worker goroutine.
 
@@ -3637,10 +3789,18 @@ func (sshClient *sshClient) setUdpgwChannelHandler(udpgwChannelHandler *udpgwPor
 	return true
 }
 
+// light_proxy_client_events is intentionally omitted; sshClient accumulates
+// these events separately.
 var serverTunnelStatParams = append(
 	[]requestParamSpec{
 		{"last_connected", isLastConnected, requestParamOptional},
-		{"establishment_duration", isIntString, requestParamOptional}},
+		{"establishment_duration", isIntString, requestParamOptional},
+		{"light_proxy_id", isAnyString, requestParamOptional},
+		{"light_proxy_entry_tracker", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"light_proxy_dial_IPv4", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"light_proxy_dial_IPv6", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"light_proxy_dial_failed", isIntString, requestParamOptional | requestParamLogStringAsInt},
+		{"light_proxy_dial_canceled", isIntString, requestParamOptional | requestParamLogStringAsInt}},
 	baseAndDialParams...)
 
 func (sshClient *sshClient) logTunnel(additionalMetrics []LogFields) {
@@ -3714,6 +3874,8 @@ func (sshClient *sshClient) logTunnel(additionalMetrics []LogFields) {
 		logFields["peak_concurrent_dialing_port_forward_count_tcp"] = sshClient.tcpTrafficState.peakConcurrentDialingPortForwardCount
 		logFields["peak_concurrent_port_forward_count_tcp"] = sshClient.tcpTrafficState.peakConcurrentPortForwardCount
 		logFields["total_port_forward_count_tcp"] = sshClient.tcpTrafficState.totalPortForwardCount
+		// See comment in allocatePortForward.
+		logFields["total_domain_port_forward_count_tcp"] = sshClient.tcpTrafficState.totalDomainPortForwardCount
 		logFields["bytes_up_udp"] = sshClient.udpTrafficState.bytesUp
 		logFields["bytes_down_udp"] = sshClient.udpTrafficState.bytesDown
 		// sshClient.udpTrafficState.peakConcurrentDialingPortForwardCount isn't meaningful
@@ -3823,6 +3985,13 @@ func (sshClient *sshClient) logTunnel(additionalMetrics []LogFields) {
 		logFields["proxy_protocol_header_failed"] = sshClient.proxyProtocolMetrics.failed.Load()
 	}
 
+	if len(sshClient.clientEvents) > 0 {
+		logFields["client_events"] = sshClient.clientEvents
+	}
+	if len(sshClient.lightProxyClientEvents) > 0 {
+		logFields["light_proxy_client_events"] = sshClient.lightProxyClientEvents
+	}
+
 	// Merge in additional metrics from the optional metrics source
 	for _, metrics := range additionalMetrics {
 		for name, value := range metrics {
@@ -3857,6 +4026,20 @@ func (sshClient *sshClient) logBlocklistHits(IP net.IP, domain string, tags []Bl
 
 	sshClient.Lock()
 
+	logCount := len(tags)
+	remaining := SSH_CLIENT_MAX_BLOCKLIST_HIT_LOGS -
+		sshClient.blocklistHitsLogCount
+	if remaining < 0 {
+		remaining = 0
+	}
+	if logCount > remaining {
+		logCount = remaining
+	}
+	logLimitExceeded :=
+		logCount < len(tags) &&
+			sshClient.blocklistHitsLogCount <= SSH_CLIENT_MAX_BLOCKLIST_HIT_LOGS
+	sshClient.blocklistHitsLogCount += len(tags)
+
 	// Log this using the client, not peer, GeoIP. In the case of in-proxy
 	// tunnel protocols, the client GeoIP fields will be None if the
 	// handshake does not complete. In that case, no port forwarding will
@@ -3875,7 +4058,11 @@ func (sshClient *sshClient) logBlocklistHits(IP net.IP, domain string, tags []Bl
 
 	sshClient.Unlock()
 
-	for _, tag := range tags {
+	if logLimitExceeded {
+		log.WithTrace().Warning("blocklist hits log limit exceeded")
+	}
+
+	for _, tag := range tags[:logCount] {
 		if IP != nil {
 			logFields["blocklist_ip_address"] = IP.String()
 		}
@@ -4044,16 +4231,27 @@ func (sshClient *sshClient) getAlertActionURLs(alertReason string) []string {
 	sshClient.Lock()
 	sponsorID, _ := getStringRequestParam(
 		sshClient.handshakeState.apiParams, "sponsor_id")
+	clientPlatform, _ := getStringRequestParam(
+		sshClient.handshakeState.apiParams, "client_platform")
+	clientFeatures := sshClient.handshakeState.clientFeatures
 	clientGeoIPData := sshClient.clientGeoIPData
 	deviceRegion := sshClient.handshakeState.deviceRegion
 	sshClient.Unlock()
+
+	normalizedClientPlatform := normalizeClientPlatform(clientPlatform)
+
+	clientFeatureValues :=
+		sshClient.sshServer.selectHomepageURLQueryParameterClientFeatures(
+			clientFeatures)
 
 	return sshClient.sshServer.support.PsinetDatabase.GetAlertActionURLs(
 		alertReason,
 		sponsorID,
 		clientGeoIPData.Country,
 		clientGeoIPData.ASN,
-		deviceRegion)
+		deviceRegion,
+		normalizedClientPlatform,
+		clientFeatureValues)
 }
 
 func (sshClient *sshClient) rejectNewChannel(newChannel ssh.NewChannel, logMessage string) {
@@ -4101,6 +4299,10 @@ func (sshClient *sshClient) rejectNewChannel(newChannel ssh.NewChannel, logMessa
 func (sshClient *sshClient) setHandshakeState(
 	state handshakeState,
 	authorizations []string) (*handshakeStateInfo, error) {
+
+	// TODO: defer setting completed to true until all checks pass. Otherwise
+	// rejected handshakes are logged as completed and may permit port
+	// forwards before asynchronous shutdown.
 
 	sshClient.Lock()
 	completed := sshClient.handshakeState.completed
@@ -4165,6 +4367,8 @@ func (sshClient *sshClient) setHandshakeState(
 
 			if p.WeightedCoinFlip(
 				parameters.RestrictInproxyProviderIDsServerProbability) {
+				log.WithTraceFields(LogFields{"error": errRestrictedProvider}).Debug(
+					"handshake rejected client")
 				return nil, errRestrictedProvider
 			}
 		}
@@ -4403,36 +4607,6 @@ func (sshClient *sshClient) updateAPIParameters(
 	for name, value := range apiParams {
 		sshClient.handshakeState.apiParams[name] = value
 	}
-}
-
-func (sshClient *sshClient) acceptDomainBytes() bool {
-	sshClient.Lock()
-	defer sshClient.Unlock()
-
-	// When the domain bytes checksum differs from the checksum sent to the
-	// client in the handshake response, the psinet regex configuration has
-	// changed. In this case, drop the stats so we don't continue to record
-	// stats as previously configured.
-	//
-	// Limitations:
-	// - The checksum comparison may result in dropping some stats for a
-	//   domain that remains in the new configuration.
-	// - We don't push new regexs to the clients, so clients that remain
-	//   connected will continue to send stats that will be dropped; and
-	//   those clients will not send stats as newly configured until after
-	//   reconnecting.
-	// - Due to the design of
-	//   transferstats.ReportRecentBytesTransferredForServer in the client,
-	//   the client may accumulate stats, reconnect before its next status
-	//   request, get a new regex configuration, and then send the previously
-	//   accumulated stats in its next status request. The checksum scheme
-	//   won't prevent the reporting of those stats.
-
-	sponsorID, _ := getStringRequestParam(sshClient.handshakeState.apiParams, "sponsor_id")
-
-	domainBytesChecksum := sshClient.sshServer.support.PsinetDatabase.GetDomainBytesChecksum(sponsorID)
-
-	return bytes.Equal(sshClient.handshakeState.domainBytesChecksum, domainBytesChecksum)
 }
 
 // setOSLConfig resets the client's OSL seed state based on the latest OSL config
@@ -4923,6 +5097,8 @@ func (sshClient *sshClient) isDomainPermitted(domain string) (bool, string) {
 		return false, "invalid domain name"
 	}
 
+	domain = normalizeHostAddress(domain)
+
 	// Don't even attempt to resolve the default mDNS top-level domain.
 	// Non-default cases won't be caught here but should fail to resolve due
 	// to the PreferGo setting in net.Resolver.
@@ -5014,7 +5190,7 @@ func (sshClient *sshClient) abortedTCPPortForward() {
 	sshClient.tcpTrafficState.concurrentDialingPortForwardCount -= 1
 }
 
-func (sshClient *sshClient) allocatePortForward(portForwardType int) bool {
+func (sshClient *sshClient) allocatePortForward(portForwardType int, isDomainName bool) bool {
 
 	sshClient.Lock()
 	defer sshClient.Unlock()
@@ -5059,6 +5235,15 @@ func (sshClient *sshClient) allocatePortForward(portForwardType int) bool {
 		state.peakConcurrentPortForwardCount = state.concurrentPortForwardCount
 	}
 	state.totalPortForwardCount += 1
+	if isDomainName {
+
+		// isDomainName applies only to TCP port forward mode. VPN user
+		// traffic is not tracked or distinguished: iOS VPN does not use port
+		// forward mode, and Android VPN uses udpgw for DNS, while tun2socks
+		// traffic port forwards are IP addresses only.
+
+		state.totalDomainPortForwardCount += 1
+	}
 
 	return true
 }
@@ -5078,7 +5263,7 @@ func (sshClient *sshClient) allocatePortForward(portForwardType int) bool {
 // goroutine) are released or will very soon be released before
 // proceeding.
 func (sshClient *sshClient) establishedPortForward(
-	portForwardType int, portForwardLRU *common.LRUConns) {
+	portForwardType int, portForwardLRU *common.LRUConns, isDomainName bool) {
 
 	// Do not lock sshClient here.
 
@@ -5115,7 +5300,7 @@ func (sshClient *sshClient) establishedPortForward(
 	//   serialized and TCP calls are limited by the dial
 	//   queue/count.
 
-	if !sshClient.allocatePortForward(portForwardType) {
+	if !sshClient.allocatePortForward(portForwardType, isDomainName) {
 
 		portForwardLRU.CloseOldest()
 
@@ -5124,7 +5309,7 @@ func (sshClient *sshClient) establishedPortForward(
 		}
 
 		state.availablePortForwardCond.L.Lock()
-		for !sshClient.allocatePortForward(portForwardType) {
+		for !sshClient.allocatePortForward(portForwardType, isDomainName) {
 			state.availablePortForwardCond.Wait()
 		}
 		state.availablePortForwardCond.L.Unlock()
@@ -5260,7 +5445,7 @@ func (sshClient *sshClient) handleTCPChannel(
 	addProxyProtocolHeader :=
 		sshClient.handshakeState.proxyProtocolHeaderConfig != nil &&
 			sshClient.handshakeState.proxyProtocolHeaderConfig.targetDestinationAddresses.Contains(
-				normalizeProxyProtocolTargetDestinationAddress(hostToConnect))
+				normalizeHostAddress(hostToConnect))
 
 	// Validate the domain name and check the domain blocklist before dialing.
 	//
@@ -5275,7 +5460,10 @@ func (sshClient *sshClient) handleTCPChannel(
 	// handle DNS-over-TCP; in the DNS-over-TCP case, a client may bypass the
 	// block list check.
 
-	if net.ParseIP(hostToConnect) == nil {
+	IP := net.ParseIP(hostToConnect)
+	isDomainName := IP == nil
+
+	if isDomainName {
 
 		ok, rejectMessage := sshClient.isDomainPermitted(hostToConnect)
 		if !ok {
@@ -5295,8 +5483,6 @@ func (sshClient *sshClient) handleTCPChannel(
 	// cancelled when the client is stopping) and timeouts.
 
 	dialStartTime := time.Now()
-
-	IP := net.ParseIP(hostToConnect)
 
 	if IP == nil {
 
@@ -5502,7 +5688,8 @@ func (sshClient *sshClient) handleTCPChannel(
 	// - Closed LRU TCP sockets will enter the TIME_WAIT state,
 	//   continuing to consume some resources.
 
-	sshClient.establishedPortForward(portForwardTypeTCP, sshClient.tcpPortForwardLRU)
+	sshClient.establishedPortForward(
+		portForwardTypeTCP, sshClient.tcpPortForwardLRU, isDomainName)
 
 	// "established = true" cancels the deferred abortedTCPPortForward()
 	established = true
@@ -5549,14 +5736,18 @@ func (sshClient *sshClient) handleTCPChannel(
 		// alternative for Psiphon use cases which previously added PROXY
 		// headers on the client side.
 		//
-		// Limitation: addOrReplaceProxyProtocolHeader attempts to first read
-		// any PROXY protocol sent by the client, and as a result is not
-		// compatible with server-first network protocols. See also the PROXY
-		// v1/v2 signature limitations in addOrReplaceProxyProtocolHeader.
+		// Limitation: proxyheader.AddOrReplaceProxyProtocolHeader attempts to
+		// first read any PROXY protocol sent by the client, and as a result
+		// is not compatible with server-first network protocols. See also
+		// the PROXY v1/v2 signature limitations in
+		// proxyheader.AddOrReplaceProxyProtocolHeader.
 
-		wireHeader, err := makeProxyProtocolHeader(
-			sshClient.handshakeState.proxyProtocolHeaderConfig.macKey[:proxyProtocolHeaderKeyIDSize],
-			sshClient.handshakeState.proxyProtocolHeaderConfig.macKey[proxyProtocolHeaderKeyIDSize:],
+		macKey := sshClient.handshakeState.proxyProtocolHeaderConfig.macKey
+		customTLV := sshClient.handshakeState.proxyProtocolHeaderConfig.customTLV
+		wireHeader, err := proxyheader.MakeProxyProtocolHeader(
+			macKey[:proxyheader.ProxyProtocolHeaderKeyIDSize],
+			macKey[proxyheader.ProxyProtocolHeaderKeyIDSize:],
+			customTLV,
 			net.ParseIP(sshClient.clientIP),
 			IP,
 			portToConnect)
@@ -5566,7 +5757,7 @@ func (sshClient *sshClient) handleTCPChannel(
 			return
 		}
 
-		bytesRead, replaced, err := addOrReplaceProxyProtocolHeader(
+		bytesRead, replaced, err := proxyheader.AddOrReplaceProxyProtocolHeader(
 			fwdChannel,
 			fwdConn,
 			wireHeader)

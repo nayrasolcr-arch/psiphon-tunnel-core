@@ -132,6 +132,8 @@ func GetQUICMaxPacketSizeAdjustment() int {
 type webRTCSDPMetrics struct {
 	iceCandidateCount      int
 	iceCandidateTypes      []ICECandidateType
+	iceRegion              string
+	iceASN                 string
 	hasIPv4                bool
 	hasIPv6                bool
 	hasPrivateIP           bool
@@ -168,15 +170,13 @@ func filterSDPAddresses(
 	return nil, nil, errors.Trace(errNotEnabled)
 }
 
-func initPortMapper(coordinator WebRTCDialCoordinator) {
-}
-
 type PortMappingProbe struct {
 }
 
 func probePortMapping(
 	ctx context.Context,
-	logger common.Logger) (PortMappingTypes, *PortMappingProbe, error) {
+	logger common.Logger,
+	coordinator WebRTCDialCoordinator) (PortMappingTypes, *PortMappingProbe, error) {
 
 	return nil, nil, errors.Trace(errNotEnabled)
 }

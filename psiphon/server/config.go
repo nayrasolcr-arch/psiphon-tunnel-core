@@ -42,6 +42,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/osl"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/proxyheader"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tactics"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/values"
 	"golang.org/x/crypto/nacl/box"
@@ -394,6 +395,16 @@ type Config struct {
 	// CPU profiling. For the default, 0, no CPU profile is taken.
 	ProcessCPUProfileDurationSeconds int `json:",omitempty"`
 
+	// ProfileProtobufFormat specifies that the profiles written on
+	// SIGUSR2 use the gzip-compressed protocol buffer format, with function
+	// names, files and lines embedded, so that pprof tooling reads them
+	// without the psiphond binary. For the default, false, they use the
+	// legacy text format a programmer reads without tools, whose symbols
+	// live in comments that tools discard. Only the SIGUSR2 profiles are
+	// affected; the profiles the server writes on its own keep the text
+	// format.
+	ProfileProtobufFormat bool `json:",omitempty"`
+
 	// TrafficRulesFilename is the path of a file containing a JSON-encoded
 	// TrafficRulesSet, the traffic rules to apply to Psiphon client tunnels.
 	TrafficRulesFilename string `json:",omitempty"`
@@ -605,8 +616,14 @@ type Config struct {
 	//
 	// There is one MAC key per configured sponsor ID, and each key is a
 	// base64-encoded concatenation of the key ID and key value
-	// (see makeProxyProtocolHeader).
+	// (see proxyheader.MakeProxyProtocolHeader).
 	ProxyProtocolHeaderMACKeys map[string]string `json:",omitempty"`
+
+	// ProxyProtocolHeaderCustomTLVs are optional custom TLVs by sponsor ID.
+	// Each value is a base64-encoded concatenation of the one-byte TLV
+	// type followed by the TLV value bytes. The specified sponsor ID must
+	// also be configured in ProxyProtocolHeaderMACKeys.
+	ProxyProtocolHeaderCustomTLVs map[string]string `json:",omitempty"`
 
 	sshBeginHandshakeTimeout                       time.Duration
 	sshHandshakeTimeout                            time.Duration
@@ -623,6 +640,7 @@ type Config struct {
 	runningOnlyInproxyBroker                       bool
 	destinationBytesPeriod                         time.Duration
 	proxyProtocolHeaderMACKeys                     map[string][]byte
+	proxyProtocolHeaderCustomTLVs                  map[string][]byte
 }
 
 // GetLogFileReopenConfig gets the reopen retries, and create/mode inputs for
@@ -1009,7 +1027,8 @@ func LoadConfig(configJSON []byte) (*Config, error) {
 	if len(config.ProxyProtocolHeaderMACKeys) > 0 {
 
 		// Client tunnel handlers will reference the proxyProtocolHeaderMACKeys
-		// slices directly and assumes this memory is not mutated.
+		// and proxyProtocolHeaderCustomTLVs slices directly and assume this
+		// memory is not mutated.
 
 		config.proxyProtocolHeaderMACKeys = make(map[string][]byte)
 		for sponsorID, base64Value := range config.ProxyProtocolHeaderMACKeys {
@@ -1020,11 +1039,39 @@ func LoadConfig(configJSON []byte) (*Config, error) {
 			if err != nil {
 				return nil, errors.Tracef("invalid ProxyProtocolHeaderMACKeys value: %v", err)
 			}
-			if len(value) != proxyProtocolHeaderKeyIDSize+proxyProtocolHeaderMACKeySize {
-				return nil, errors.TraceNew("unexpected ProxyProtocolHeaderMACKeys value size")
+			err = proxyheader.ValidateMACKey(value)
+			if err != nil {
+				return nil, errors.Tracef(
+					"invalid ProxyProtocolHeaderMACKeys value: %v", err)
 			}
 			config.proxyProtocolHeaderMACKeys[sponsorID] = value
 		}
+	}
+
+	if len(config.ProxyProtocolHeaderCustomTLVs) > 0 {
+		config.proxyProtocolHeaderCustomTLVs = make(map[string][]byte)
+	}
+
+	for sponsorID, base64Value := range config.ProxyProtocolHeaderCustomTLVs {
+		_, ok := config.proxyProtocolHeaderMACKeys[sponsorID]
+		if !ok {
+			return nil, errors.TraceNew(
+				"missing ProxyProtocolHeaderMACKeys entry")
+		}
+
+		customTLV, err := base64.StdEncoding.DecodeString(base64Value)
+		if err != nil {
+			return nil, errors.Tracef(
+				"invalid ProxyProtocolHeaderCustomTLVs value: %v", err)
+		}
+
+		err = proxyheader.ValidateCustomTLV(customTLV)
+		if err != nil {
+			return nil, errors.Tracef(
+				"invalid ProxyProtocolHeaderCustomTLVs value: %v", err)
+		}
+
+		config.proxyProtocolHeaderCustomTLVs[sponsorID] = customTLV
 	}
 
 	return &config, nil

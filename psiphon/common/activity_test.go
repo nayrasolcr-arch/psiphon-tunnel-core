@@ -30,6 +30,9 @@ import (
 func TestActivityMonitoredConn(t *testing.T) {
 	buffer := make([]byte, 1024)
 
+	realStartTimeBefore := time.Now().UTC()
+	monotonicStartTimeBefore := monotime.Now()
+
 	conn, err := NewActivityMonitoredConn(
 		&dummyConn{},
 		200*time.Millisecond,
@@ -39,9 +42,8 @@ func TestActivityMonitoredConn(t *testing.T) {
 		t.Fatalf("NewActivityMonitoredConn failed")
 	}
 
-	realStartTime := time.Now().UTC()
-
-	monotonicStartTime := monotime.Now()
+	realStartTimeAfter := time.Now().UTC()
+	monotonicStartTimeAfter := monotime.Now()
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -66,12 +68,12 @@ func TestActivityMonitoredConn(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
+	lastSuccessfulReadTimeBefore := monotime.Now()
 	_, err = conn.Read(buffer)
+	lastSuccessfulReadTimeAfter := monotime.Now()
 	if err != nil {
 		t.Fatalf("previous write failed to extend timeout")
 	}
-
-	lastSuccessfulReadTime := monotime.Now()
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -87,16 +89,58 @@ func TestActivityMonitoredConn(t *testing.T) {
 		t.Fatalf("failed to timeout")
 	}
 
-	if realStartTime.Round(time.Millisecond) != conn.GetStartTime().Round(time.Millisecond) {
+	// Check time ranges since time.Now() in NewActivityMonitoredConn may not
+	// match outer time check, even if rounded to milliseconds.
+
+	startTime := conn.GetStartTime()
+	if startTime.Before(realStartTimeBefore) || startTime.After(realStartTimeAfter) {
 		t.Fatalf("unexpected GetStartTime")
 	}
 
-	diff := lastSuccessfulReadTime.Sub(monotonicStartTime).Nanoseconds() - conn.GetActiveDuration().Nanoseconds()
-	if diff < 0 {
-		diff = -diff
-	}
-	if diff > (1 * time.Millisecond).Nanoseconds() {
+	activeDuration := conn.GetActiveDuration()
+	if activeDuration < lastSuccessfulReadTimeBefore.Sub(monotonicStartTimeAfter) ||
+		activeDuration > lastSuccessfulReadTimeAfter.Sub(monotonicStartTimeBefore) {
 		t.Fatalf("unexpected GetActiveDuration")
+	}
+
+	// Test: SetInactivityTimeout
+
+	conn, err = NewActivityMonitoredConn(
+		&dummyConn{},
+		200*time.Millisecond,
+		false,
+		nil)
+	if err != nil {
+		t.Fatalf("NewActivityMonitoredConn failed")
+	}
+
+	err = conn.SetInactivityTimeout(-1)
+	if err == nil {
+		t.Fatalf("unexpected SetInactivityTimeout success")
+	}
+
+	err = conn.SetInactivityTimeout(0)
+	if err != nil {
+		t.Fatalf("SetInactivityTimeout failed")
+	}
+
+	time.Sleep(400 * time.Millisecond)
+
+	_, err = conn.Read(buffer)
+	if err != nil {
+		t.Fatalf("read after deactivated timeout failed")
+	}
+
+	err = conn.SetInactivityTimeout(200 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("SetInactivityTimeout failed")
+	}
+
+	time.Sleep(400 * time.Millisecond)
+
+	_, err = conn.Read(buffer)
+	if err != iotest.ErrTimeout {
+		t.Fatalf("failed to timeout")
 	}
 }
 

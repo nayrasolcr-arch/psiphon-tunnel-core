@@ -70,6 +70,7 @@ func runTestInproxy(doMustUpgrade bool) error {
 	numProxies := 5
 	proxyMaxClients := 3
 	numClients := 10
+	sharedProxyLimitsProxyCount := 2
 
 	bytesToSend := 1 << 20
 	targetElapsedSeconds := 2
@@ -132,6 +133,7 @@ func runTestInproxy(doMustUpgrade bool) error {
 		// Minimize test parameters for MustUpgrade case
 		numProxies = 1
 		proxyMaxClients = 1
+		sharedProxyLimitsProxyCount = 0
 		numClients = 1
 		testDisableSTUN = true
 		testDisablePortMapping = true
@@ -345,6 +347,7 @@ func runTestInproxy(doMustUpgrade bool) error {
 		ServerRootObfuscationSecret:  serverRootObfuscationSecret,
 		BrokerPublicKeys:             []SessionPublicKey{brokerPublicKey},
 		BrokerRootObfuscationSecrets: []ObfuscationSecret{brokerRootObfuscationSecret},
+		BrokerSpecHashes:             [][]byte{[]byte("test-broker-spec-hash")},
 		BrokerRoundTripperMaker:      makeServerBrokerClientRoundTripper,
 		ProxyMetricsValidator:        apiParameterValidator,
 		ProxyMetricsFormatter:        apiParameterLogFieldFormatter,
@@ -477,6 +480,43 @@ func runTestInproxy(doMustUpgrade bool) error {
 
 	logger.WithTrace().Info("START PROXIES")
 
+	var sharedProxyLimits *common.ProxyLimits
+	if sharedProxyLimitsProxyCount > 0 {
+		sharedProxyLimits, err = common.NewProxyLimits(&common.ProxyLimitsConfig{
+			MaxCommonClients:               sharedProxyLimitsProxyCount * proxyMaxClients,
+			CommonUpstreamBytesPerSecond:   bytesToSend / targetElapsedSeconds,
+			CommonDownstreamBytesPerSecond: bytesToSend / targetElapsedSeconds,
+
+			MaxPersonalClients:               sharedProxyLimitsProxyCount * proxyMaxClients,
+			PersonalUpstreamBytesPerSecond:   bytesToSend / targetElapsedSeconds,
+			PersonalDownstreamBytesPerSecond: bytesToSend / targetElapsedSeconds,
+		})
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+
+	// Exercise dynamic rate limit changes
+
+	var updateLimitsOnce sync.Once
+	var updateLimitsErr error
+	updateLimits := func() error {
+		if sharedProxyLimits == nil {
+			return nil
+		}
+		updateLimitsOnce.Do(func() {
+			maxClients := sharedProxyLimitsProxyCount * proxyMaxClients
+			updateLimitsErr = sharedProxyLimits.SetCommonLimits(
+				maxClients, bytesToSend, bytesToSend)
+			if updateLimitsErr != nil {
+				return
+			}
+			updateLimitsErr = sharedProxyLimits.SetPersonalLimits(
+				maxClients, bytesToSend, bytesToSend)
+		})
+		return updateLimitsErr
+	}
+
 	for i := 0; i < numProxies; i++ {
 
 		proxyPrivateKey, err := GenerateSessionPrivateKey()
@@ -536,7 +576,7 @@ func runTestInproxy(doMustUpgrade bool) error {
 
 		name := fmt.Sprintf("proxy-%d", i)
 
-		proxy, err := NewProxy(&ProxyConfig{
+		proxyConfig := &ProxyConfig{
 
 			Logger: testutils.NewTestLoggerWithComponent(name),
 
@@ -561,11 +601,6 @@ func runTestInproxy(doMustUpgrade bool) error {
 			},
 
 			HandleTacticsPayload: makeHandleTacticsPayload(proxyPrivateKey, tacticsNetworkID),
-
-			MaxCommonClients:              proxyMaxClients,
-			MaxPersonalClients:            proxyMaxClients,
-			LimitUpstreamBytesPerSecond:   bytesToSend / targetElapsedSeconds,
-			LimitDownstreamBytesPerSecond: bytesToSend / targetElapsedSeconds,
 
 			ActivityUpdater: func(
 				announcing int32,
@@ -602,7 +637,18 @@ func runTestInproxy(doMustUpgrade bool) error {
 				close(receivedProxyMustUpgrade)
 				cancelRun()
 			},
-		})
+		}
+
+		if i < sharedProxyLimitsProxyCount {
+			proxyConfig.ProxyLimits = sharedProxyLimits
+		} else {
+			proxyConfig.MaxCommonClients = proxyMaxClients
+			proxyConfig.MaxPersonalClients = proxyMaxClients
+			proxyConfig.LimitUpstreamBytesPerSecond = bytesToSend / targetElapsedSeconds
+			proxyConfig.LimitDownstreamBytesPerSecond = bytesToSend / targetElapsedSeconds
+		}
+
+		proxy, err := NewProxy(proxyConfig)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -785,6 +831,13 @@ func runTestInproxy(doMustUpgrade bool) error {
 							"unexpected bytes: expected at index %d, received at index %d",
 							bytes.Index(sendBytes, buf[:m]), n)
 					}
+					if n < bytesToSend/2 && n+m >= bytesToSend/2 {
+						// Invoke dynamic rate limit change while bulk relaying
+						err = updateLimits()
+						if err != nil {
+							return errors.Trace(err)
+						}
+					}
 					n += m
 				}
 
@@ -797,6 +850,20 @@ func runTestInproxy(doMustUpgrade bool) error {
 				select {
 				case <-signalRelayComplete:
 				case <-testCtx.Done():
+				}
+
+				// Unreliable data channels must continue framing every
+				// message after traffic shaping ends.
+
+				if !isTCP && !webRTCCoordinator.UseMediaStreams() {
+					conn.webRTCConn.writeMutex.Lock()
+					paddingHeadersDone := conn.webRTCConn.trafficShapingDone
+					conn.webRTCConn.writeMutex.Unlock()
+
+					if paddingHeadersDone {
+						return errors.TraceNew(
+							"unreliable data channel stopped sending padding headers")
+					}
 				}
 
 				fmt.Printf("[%s][%s] closing\n",
@@ -815,7 +882,8 @@ func runTestInproxy(doMustUpgrade bool) error {
 	newClientBrokerClient := func(
 		disableWaitToShareSession bool,
 		commonCompartmentIDs []ID,
-		personalCompartmentIDs []ID) (*BrokerClient, error) {
+		personalCompartmentIDs []ID,
+		clientRegion string) (*BrokerClient, error) {
 
 		clientPrivateKey, err := GenerateSessionPrivateKey()
 		if err != nil {
@@ -835,7 +903,8 @@ func runTestInproxy(doMustUpgrade bool) error {
 			brokerPublicKey:             brokerPublicKey,
 			brokerRootObfuscationSecret: brokerRootObfuscationSecret,
 			brokerClientRoundTripper: newHTTPRoundTripper(
-				brokerListener.Addr().String(), "client"),
+				brokerListener.Addr().String(),
+				fmt.Sprintf("client/%s", clientRegion)),
 			brokerClientRoundTripperSucceeded: roundTripperSucceded,
 			brokerClientRoundTripperFailed:    roundTripperFailed,
 			brokerClientNoMatch:               noMatch,
@@ -919,22 +988,26 @@ func runTestInproxy(doMustUpgrade bool) error {
 		return webRTCCoordinator, nil
 	}
 
-	sharedCommonBrokerClient, err := newClientBrokerClient(false, testCommonCompartmentIDs, nil)
+	sharedCommonBrokerClient, err := newClientBrokerClient(
+		false, testCommonCompartmentIDs, nil, "REGION-A")
 	if err != nil {
 		return errors.Trace(err)
 	}
 
-	sharedCommonBrokerClientDisableWait, err := newClientBrokerClient(true, testCommonCompartmentIDs, nil)
+	sharedCommonBrokerClientDisableWait, err := newClientBrokerClient(
+		true, testCommonCompartmentIDs, nil, "REGION-B")
 	if err != nil {
 		return errors.Trace(err)
 	}
 
-	sharedPersonalBrokerClient, err := newClientBrokerClient(false, nil, testPersonalCompartmentIDs)
+	sharedPersonalBrokerClient, err := newClientBrokerClient(
+		false, nil, testPersonalCompartmentIDs, "REGION-A")
 	if err != nil {
 		return errors.Trace(err)
 	}
 
-	sharedPersonalBrokerClientDisableWait, err := newClientBrokerClient(true, nil, testPersonalCompartmentIDs)
+	sharedPersonalBrokerClientDisableWait, err := newClientBrokerClient(
+		true, nil, testPersonalCompartmentIDs, "REGION-B")
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -954,8 +1027,11 @@ func runTestInproxy(doMustUpgrade bool) error {
 		// Exercise BrokerClients shared by multiple clients, but also create
 		// several broker clients.
 		//
-		// Per-region testing is handled by the HTTP server alternating regions
-		// based on request count.
+		clientRegion := "REGION-A"
+		if i%2 != 0 {
+			clientRegion = "REGION-B"
+		}
+
 		var brokerClient *BrokerClient
 		switch i % 3 {
 		case 0:
@@ -972,9 +1048,11 @@ func runTestInproxy(doMustUpgrade bool) error {
 			}
 		case 2:
 			if isPersonalClient {
-				brokerClient, err = newClientBrokerClient(true, nil, testPersonalCompartmentIDs)
+				brokerClient, err = newClientBrokerClient(
+					true, nil, testPersonalCompartmentIDs, clientRegion)
 			} else {
-				brokerClient, err = newClientBrokerClient(true, testCommonCompartmentIDs, nil)
+				brokerClient, err = newClientBrokerClient(
+					true, testCommonCompartmentIDs, nil, clientRegion)
 			}
 			if err != nil {
 				return errors.Trace(err)
@@ -985,6 +1063,12 @@ func runTestInproxy(doMustUpgrade bool) error {
 			isMobile, useMediaStreams)
 		if err != nil {
 			return errors.Trace(err)
+		}
+
+		// Exercise unreliable data channel framing both with and without
+		// configured traffic shaping.
+		if !isTCP && !useMediaStreams && !isPersonalClient {
+			webRTCCoordinator.trafficShapingParameters = nil
 		}
 
 		clientsGroup.Go(
@@ -1121,36 +1205,16 @@ func runTestInproxy(doMustUpgrade bool) error {
 
 func runHTTPServer(listener net.Listener, broker *Broker) error {
 
-	// Track client regions by RemoteAddr
-	var clientRegionsMutex sync.Mutex
-	clientRegions := make(map[string]string)
-	var clientRegionCount atomic.Int32
-
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
-		// For this test, clients set the path to "/client" and proxies
-		// set the path to "/proxy" and we use that to create stub GeoIP
-		// data to pass the not-same-ASN condition.
-		//
-		// For per-region testing, each client gets an alternating sticky region
-		// (REGION-A or REGION-B) based on its RemoteAddr
+		// Clients encode their test region in the path. Proxies use "/proxy".
+		// The path also supplies stub ASN data for the not-same-ASN condition.
 		var geoIPData common.GeoIPData
 		geoIPData.ASN = r.URL.Path
 
 		path := r.URL.Path
-		if strings.HasPrefix(path, "/client") {
-			clientRegionsMutex.Lock()
-			clientRegion, ok := clientRegions[r.RemoteAddr]
-			if !ok {
-				if clientRegionCount.Add(1)%2 == 0 {
-					clientRegion = "REGION-A"
-				} else {
-					clientRegion = "REGION-B"
-				}
-				clientRegions[r.RemoteAddr] = clientRegion
-			}
-			clientRegionsMutex.Unlock()
-			geoIPData.Country = clientRegion
+		if strings.HasPrefix(path, "/client/") {
+			geoIPData.Country = strings.TrimPrefix(path, "/client/")
 		} else if strings.HasPrefix(path, "/proxy") {
 			geoIPData.Country = "PROXY-REGION"
 		}

@@ -92,7 +92,6 @@ const (
 	LimitIntensiveConnectionWorkers                    = "LimitIntensiveConnectionWorkers"
 	UpstreamProxyErrorMinWaitDuration                  = "UpstreamProxyErrorMinWaitDuration"
 	UpstreamProxyErrorMaxWaitDuration                  = "UpstreamProxyErrorMaxWaitDuration"
-	IgnoreHandshakeStatsRegexps                        = "IgnoreHandshakeStatsRegexps"
 	PrioritizeTunnelProtocolsProbability               = "PrioritizeTunnelProtocolsProbability"
 	PrioritizeTunnelProtocols                          = "PrioritizeTunnelProtocols"
 	PrioritizeTunnelProtocolsCandidateCount            = "PrioritizeTunnelProtocolsCandidateCount"
@@ -174,6 +173,10 @@ const (
 	PsiphonAPIPersistentStatsMaxCount                  = "PsiphonAPIPersistentStatsMaxCount"
 	PsiphonAPIConnectedRequestPeriod                   = "PsiphonAPIConnectedRequestPeriod"
 	PsiphonAPIConnectedRequestRetryPeriod              = "PsiphonAPIConnectedRequestRetryPeriod"
+	PsiphonAPIClientEventReportDelayMin                = "PsiphonAPIClientEventReportDelayMin"
+	PsiphonAPIClientEventReportDelayMax                = "PsiphonAPIClientEventReportDelayMax"
+	PsiphonAPIClientEventReportLimit                   = "PsiphonAPIClientEventReportLimit"
+	PsiphonAPIClientEventLengthLimit                   = "PsiphonAPIClientEventLengthLimit"
 	FetchSplitTunnelRoutesTimeout                      = "FetchSplitTunnelRoutesTimeout"
 	SplitTunnelRoutesURLFormat                         = "SplitTunnelRoutesURLFormat"
 	SplitTunnelRoutesSignaturePublicKey                = "SplitTunnelRoutesSignaturePublicKey"
@@ -185,6 +188,7 @@ const (
 	FetchUpgradeStalePeriod                            = "FetchUpgradeStalePeriod"
 	UpgradeDownloadURLs                                = "UpgradeDownloadURLs"
 	UpgradeDownloadClientVersionHeader                 = "UpgradeDownloadClientVersionHeader"
+	UpgradeTacticsWaitPeriod                           = "UpgradeTacticsWaitPeriod"
 	TotalBytesTransferredNoticePeriod                  = "TotalBytesTransferredNoticePeriod"
 	TotalBytesTransferredEmitMemoryMetrics             = "TotalBytesTransferredEmitMemoryMetrics"
 	MeekDialDomainsOnly                                = "MeekDialDomainsOnly"
@@ -453,6 +457,8 @@ const (
 	InproxyProxyAnnounceDelay                          = "InproxyProxyAnnounceDelay"
 	InproxyProxyAnnounceDelayJitter                    = "InproxyProxyAnnounceDelayJitter"
 	InproxyProxyAnnounceMaxBackoffDelay                = "InproxyProxyAnnounceMaxBackoffDelay"
+	InproxyProxyAnnounceCommonOverride                 = "InproxyProxyAnnounceCommonOverride"
+	InproxyProxyAnnouncePersonalOverride               = "InproxyProxyAnnouncePersonalOverride"
 	InproxyProxyAnswerRequestTimeout                   = "InproxyProxyAnswerRequestTimeout"
 	InproxyClientOfferRequestTimeout                   = "InproxyClientOfferRequestTimeout"
 	InproxyClientOfferRequestPersonalTimeout           = "InproxyClientOfferRequestPersonalTimeout"
@@ -570,6 +576,8 @@ const (
 	DSLFetcherGetLastActiveOSLsTTL                     = "DSLFetcherGetLastActiveOSLsTTL"
 	DSLFetcherGetOSLFileSpecsMinCount                  = "DSLFetcherGetOSLFileSpecsMinCount"
 	DSLFetcherGetOSLFileSpecsMaxCount                  = "DSLFetcherGetOSLFileSpecsMaxCount"
+	DSLAccessTokenDisableRegistration                  = "DSLAccessTokenDisableRegistration"
+	DSLAccessTokenRegistrationRefreshTTL               = "DSLAccessTokenRegistrationRefreshTTL"
 	DSLPrioritizeDialNewServerEntryProbability         = "DSLPrioritizeDialNewServerEntryProbability"
 	DSLPrioritizeDialExistingServerEntryProbability    = "DSLPrioritizeDialExistingServerEntryProbability"
 	DSLPrioritizeDialRetainFailedProbability           = "DSLPrioritizeDialRetainFailedProbability"
@@ -589,15 +597,20 @@ const (
 	SSHChannelWindowSize                               = "SSHChannelWindowSize"
 	SSHPacketTunnelChannelWindowSize                   = "SSHPacketTunnelChannelWindowSize"
 	DisableServerEntriesReporter                       = "DisableServerEntriesReporter"
-	LightProxyDisable                                  = "LightProxyDisable"
+	LightProxyDisableFallback                          = "LightProxyDisableFallback"
 	LightProxyCustomHostNameRegexes                    = "LightProxyCustomHostNameRegexes"
 	LightProxyCustomHostNameProbability                = "LightProxyCustomHostNameProbability"
-	LightProxyUseRecommendedSNIProbability             = "LightProxyUseRecommendedSNIProbability"
 	LightProxyTunnelInactiveThreshold                  = "LightProxyTunnelInactiveThreshold"
 	LightProxyDialTimeout                              = "LightProxyDialTimeout"
+	LightProxyInactivityTimeout                        = "LightProxyInactivityTimeout"
+	LightProxyLimitDestinationAddresses                = "LightProxyLimitDestinationAddresses"
+	LightProxyPersonalPairingConnectionWorkerPoolSize  = "LightProxyPersonalPairingConnectionWorkerPoolSize"
+	HomepageURLQueryParameterClientFeatures            = "HomepageURLQueryParameterClientFeatures"
 
 	// Retired parameters
 
+	LightProxyUseRecommendedSNIProbability    = "LightProxyUseRecommendedSNIProbability"
+	LightProxyDisable                         = "LightProxyDisable"
 	ReplayRandomizedTLSProfile                = "ReplayRandomizedTLSProfile"
 	InproxyAllBrokerPublicKeys                = "InproxyAllBrokerPublicKeys"
 	InproxyTunnelProtocolSelectionProbability = "InproxyTunnelProtocolSelectionProbability"
@@ -652,7 +665,6 @@ var defaultParameters = map[string]struct {
 	LimitIntensiveConnectionWorkers:          {value: 0, minimum: 0},
 	UpstreamProxyErrorMinWaitDuration:        {value: 10 * time.Second, minimum: time.Duration(0)},
 	UpstreamProxyErrorMaxWaitDuration:        {value: 30 * time.Second, minimum: time.Duration(0)},
-	IgnoreHandshakeStatsRegexps:              {value: false},
 	TunnelOperateShutdownTimeout:             {value: 1 * time.Second, minimum: 1 * time.Millisecond, flags: useNetworkLatencyMultiplier},
 	TunnelPortForwardDialTimeout:             {value: 10 * time.Second, minimum: 1 * time.Millisecond, flags: useNetworkLatencyMultiplier},
 	PacketTunnelReadTimeout:                  {value: 10 * time.Second, minimum: 1 * time.Millisecond, flags: useNetworkLatencyMultiplier},
@@ -771,6 +783,14 @@ var defaultParameters = map[string]struct {
 
 	PsiphonAPIConnectedRequestRetryPeriod: {value: 5 * time.Second, minimum: 1 * time.Millisecond},
 
+	PsiphonAPIClientEventReportDelayMin: {value: 50 * time.Millisecond, minimum: time.Duration(0)},
+	PsiphonAPIClientEventReportDelayMax: {value: 250 * time.Millisecond, minimum: time.Duration(0)},
+
+	// Report limit must not exceed the server.CLIENT_EVENTS_MAX_COUNT_PER_TUNNEL.
+	// Length limit must not exceed the server.CLIENT_EVENTS_MAX_LENGTH.
+	PsiphonAPIClientEventReportLimit: {value: 128, minimum: 0},
+	PsiphonAPIClientEventLengthLimit: {value: 64, minimum: 0},
+
 	// FetchSplitTunnelRoutesTimeout, SplitTunnelRoutesURLFormat,
 	// SplitTunnelRoutesSignaturePublicKey and SplitTunnelDNSServer are obsoleted
 	// by the server-assisted split tunnel implementation.
@@ -788,6 +808,7 @@ var defaultParameters = map[string]struct {
 	FetchUpgradeStalePeriod:            {value: 6 * time.Hour, minimum: 1 * time.Hour},
 	UpgradeDownloadURLs:                {value: TransferURLs{}},
 	UpgradeDownloadClientVersionHeader: {value: ""},
+	UpgradeTacticsWaitPeriod:           {value: 5 * time.Second, minimum: 0 * time.Second, flags: useNetworkLatencyMultiplier},
 
 	TotalBytesTransferredNoticePeriod:      {value: 5 * time.Minute, minimum: 1 * time.Second},
 	TotalBytesTransferredEmitMemoryMetrics: {value: true},
@@ -1121,6 +1142,8 @@ var defaultParameters = map[string]struct {
 	InproxyProxyAnnounceDelay:                          {value: 100 * time.Millisecond, minimum: time.Duration(0)},
 	InproxyProxyAnnounceDelayJitter:                    {value: 0.5, minimum: 0.0},
 	InproxyProxyAnnounceMaxBackoffDelay:                {value: 1 * time.Minute, minimum: time.Duration(0)},
+	InproxyProxyAnnounceCommonOverride:                 {value: 0, minimum: 0},
+	InproxyProxyAnnouncePersonalOverride:               {value: 2, minimum: 0},
 	InproxyProxyAnswerRequestTimeout:                   {value: 10*time.Second + 10*time.Second, minimum: time.Duration(0)},
 	InproxyClientOfferRequestTimeout:                   {value: 10*time.Second + 10*time.Second, minimum: time.Duration(0)},
 	InproxyClientOfferRequestPersonalTimeout:           {value: 5*time.Second + 10*time.Second, minimum: time.Duration(0)},
@@ -1245,6 +1268,8 @@ var defaultParameters = map[string]struct {
 	DSLFetcherGetLastActiveOSLsTTL:                    {value: 24 * time.Hour, minimum: time.Duration(0)},
 	DSLFetcherGetOSLFileSpecsMinCount:                 {value: 1, minimum: 0},
 	DSLFetcherGetOSLFileSpecsMaxCount:                 {value: 1, minimum: 0},
+	DSLAccessTokenDisableRegistration:                 {value: false},
+	DSLAccessTokenRegistrationRefreshTTL:              {value: 24 * time.Hour, minimum: time.Duration(0)},
 	DSLPrioritizeDialNewServerEntryProbability:        {value: 0.5, minimum: 0.0},
 	DSLPrioritizeDialExistingServerEntryProbability:   {value: 0.25, minimum: 0.0},
 	DSLPrioritizeDialRetainFailedProbability:          {value: 0.0, minimum: 0.0},
@@ -1270,12 +1295,18 @@ var defaultParameters = map[string]struct {
 
 	DisableServerEntriesReporter: {value: false},
 
-	LightProxyDisable:                      {value: false},
-	LightProxyCustomHostNameRegexes:        {value: RegexStrings{}},
-	LightProxyCustomHostNameProbability:    {value: 0.0, minimum: 0.0},
-	LightProxyUseRecommendedSNIProbability: {value: 0.5, minimum: 0.0},
-	LightProxyTunnelInactiveThreshold:      {value: 30 * time.Second, minimum: 0 * time.Millisecond},
-	LightProxyDialTimeout:                  {value: 20 * time.Second, minimum: 1 * time.Second, flags: useNetworkLatencyMultiplier},
+	LightProxyDisableFallback:                         {value: false},
+	LightProxyDisable:                                 {value: false},
+	LightProxyCustomHostNameRegexes:                   {value: RegexStrings{}},
+	LightProxyCustomHostNameProbability:               {value: 0.0, minimum: 0.0},
+	LightProxyUseRecommendedSNIProbability:            {value: 0.5, minimum: 0.0},
+	LightProxyTunnelInactiveThreshold:                 {value: 30 * time.Second, minimum: 0 * time.Millisecond},
+	LightProxyDialTimeout:                             {value: 20 * time.Second, minimum: 1 * time.Second, flags: useNetworkLatencyMultiplier},
+	LightProxyInactivityTimeout:                       {value: 2 * time.Minute, minimum: 1 * time.Second},
+	LightProxyLimitDestinationAddresses:               {value: []string{}},
+	LightProxyPersonalPairingConnectionWorkerPoolSize: {value: 2, minimum: 1},
+
+	HomepageURLQueryParameterClientFeatures: {value: KeyStrings{}, flags: serverSideOnly},
 }
 
 // IsServerSideOnly indicates if the parameter specified by name is used
@@ -2274,13 +2305,18 @@ func (p ParametersAccessor) LabeledQUICVersions(name, label string) protocol.QUI
 // DTLSFingerprints returns a protocol.DTLSFingerprints parameter value,
 // applying a probability gate as with TLSProfiles and QUICVersions.
 func (p ParametersAccessor) DTLSFingerprints(name string) protocol.DTLSFingerprints {
+	return p.DTLSFingerprintsWithPRNG(name, prng.DefaultPRNG())
+}
 
+// DTLSFingerprintsWithPRNG returns a protocol.DTLSFingerprints parameter
+// value, applying a probability gate as with TLSProfiles and QUICVersions.
+func (p ParametersAccessor) DTLSFingerprintsWithPRNG(name string, PRNG *prng.PRNG) protocol.DTLSFingerprints {
 	probabilityName := name + "Probability"
 	_, ok := p.snapshot.parameters[probabilityName]
 	if ok {
 		probabilityValue := float64(1.0)
 		p.snapshot.getValue(probabilityName, &probabilityValue)
-		if !prng.FlipWeightedCoin(probabilityValue) {
+		if !PRNG.FlipWeightedCoin(probabilityValue) {
 			defaultParameter, ok := defaultParameters[name]
 			if ok {
 				defaultValue, ok := defaultParameter.value.(protocol.DTLSFingerprints)

@@ -24,6 +24,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -31,6 +32,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -39,6 +41,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/light"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/push"
@@ -101,7 +104,10 @@ func runTestControllerLightProxy(importPushPayload bool) (retErr error) {
 		DisableLocalSocksProxy:        true,
 		TargetServerEntry:             targetServerEntry,
 		EstablishTunnelTimeoutSeconds: &establishTunnelTimeoutSeconds,
-		EnableLightProxy:              true,
+		EnableLightProxyFallback:      true,
+		LightProxyLimitDestinationAddresses: []string{
+			webServerAddress,
+		},
 	}
 	if importPushPayload {
 		config.PushPayloadObfuscationKey = obfuscationKey
@@ -112,6 +118,14 @@ func runTestControllerLightProxy(importPushPayload bool) (retErr error) {
 	}
 
 	err = config.Commit(false)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	expectedClientEvents := []string{"test-event-1", "test-event-2", "test-event-1"}
+	err = config.SetParameters("", false, map[string]interface{}{
+		parameters.PsiphonAPIClientEventReportLimit: len(expectedClientEvents),
+	})
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -224,6 +238,15 @@ func runTestControllerLightProxy(importPushPayload bool) (retErr error) {
 		return errors.Trace(ctx.Err())
 	}
 
+	// No events are attributed before the first light proxy dial.
+	controller.RecordClientEvent("before-light-proxy-dial")
+	controller.clientEventMutex.Lock()
+	queuedClientEventCount := len(controller.lightProxyClientEvents)
+	controller.clientEventMutex.Unlock()
+	if queuedClientEventCount != 0 {
+		return errors.TraceNew("unexpected client events before light proxy dial")
+	}
+
 	if importPushPayload {
 		storedLightProxy := LoadLightProxy()
 		if storedLightProxy == nil {
@@ -242,6 +265,21 @@ func runTestControllerLightProxy(importPushPayload bool) (retErr error) {
 	err = doHTTPSWebServerFetches(ctx, localProxyPort, webServerAddress)
 	if err != nil {
 		return errors.Trace(err)
+	}
+
+	for _, event := range expectedClientEvents {
+		controller.RecordClientEvent(event)
+	}
+
+	// Events beyond the report limit are dropped.
+	controller.RecordClientEvent("test-event-3")
+	controller.RecordClientEvent("test-event-4")
+
+	controller.clientEventMutex.Lock()
+	clientEvents := slices.Clone(controller.lightProxyClientEvents)
+	controller.clientEventMutex.Unlock()
+	if !slices.Equal(clientEvents, expectedClientEvents) {
+		return errors.Tracef("unexpected light proxy client events: %v", clientEvents)
 	}
 
 	select {
@@ -328,11 +366,24 @@ func startLightTestProxy(
 		proxyIPv6Address,
 		"example.org",
 		"",
+		0.5,
+		protocol.TLS_PROFILE_CHROME_133,
+		0.5,
+		0,
+		0,
+		0,
+		0,
+		0,
 		[]string{allowedWebServerAddress},
+		nil,
+		nil,
+		nil,
 		allowedWebServerAddress)
 	if err != nil {
 		return nil, nil, errors.Trace(err)
 	}
+
+	proxyConfig.AllowBogons = true
 
 	receiver := newTestLightProxyEventReceiver()
 	proxy, err := light.NewProxy(
@@ -381,13 +432,16 @@ func makeUnreachableTargetServerEntry() (string, error) {
 	}
 
 	serverEntry := &protocol.ServerEntry{
-		IpAddress:            host,
-		WebServerPort:        "0",
-		SshPort:              sshPort,
-		SshUsername:          "unused",
-		SshPassword:          "unused",
-		SshHostKey:           base64.StdEncoding.EncodeToString([]byte("unused")),
-		Capabilities:         []string{protocol.GetCapability(protocol.TUNNEL_PROTOCOL_SSH)},
+		IpAddress:     host,
+		WebServerPort: "0",
+		SshPort:       sshPort,
+		SshUsername:   "unused",
+		SshPassword:   "unused",
+		SshHostKey:    base64.StdEncoding.EncodeToString([]byte("unused")),
+		Capabilities: []string{
+			protocol.GetCapability(protocol.TUNNEL_PROTOCOL_SSH),
+			protocol.CAPABILITY_SSH_API_REQUESTS,
+		},
 		Region:               "US",
 		ConfigurationVersion: 1,
 	}
@@ -499,6 +553,18 @@ func (r *testLightProxyEventReceiver) Resumed() {
 	fmt.Printf("[Resumed]\n")
 }
 
+func (r *testLightProxyEventReceiver) Accepted() {
+	fmt.Printf("[Accepted]\n")
+}
+
+func (r *testLightProxyEventReceiver) Rejected() {
+	fmt.Printf("[Rejected]\n")
+}
+
+func (receiver *testLightProxyEventReceiver) Activity(
+	stats *light.ActivityStats) {
+}
+
 func (receiver *testLightProxyEventReceiver) Connection(
 	stats *light.ConnectionStats) {
 
@@ -534,6 +600,8 @@ func TestControllerImportPushPayloadLightProxy(t *testing.T) {
 	}
 	defer os.RemoveAll(dataRoot)
 
+	const lightProxyEntryTTL = 1 * time.Hour
+
 	_, lightProxyEntry, err := light.Generate(
 		prng.HexString(8),
 		[]string{"127.0.0.1:1"},
@@ -541,7 +609,18 @@ func TestControllerImportPushPayloadLightProxy(t *testing.T) {
 		"",
 		"example.org",
 		"",
+		0.0,
+		"",
+		0.0,
+		0,
+		0,
+		0,
+		0,
+		lightProxyEntryTTL,
 		[]string{"example.com:443"},
+		nil,
+		nil,
+		nil,
 		"example.com:443")
 	if err != nil {
 		t.Fatal(errors.Trace(err))
@@ -553,7 +632,18 @@ func TestControllerImportPushPayloadLightProxy(t *testing.T) {
 		"",
 		"example.org",
 		"",
+		0.0,
+		"",
+		0.0,
+		0,
+		0,
+		0,
+		0,
+		lightProxyEntryTTL,
 		[]string{"example.com:443"},
+		nil,
+		nil,
+		nil,
 		"example.com:443")
 	if err != nil {
 		t.Fatal(errors.Trace(err))
@@ -569,7 +659,7 @@ func TestControllerImportPushPayloadLightProxy(t *testing.T) {
 		PropagationChannelId:          "0000000000000000",
 		SponsorId:                     "0000000000000000",
 		DisableLocalSocksProxy:        true,
-		EnableLightProxy:              true,
+		EnableLightProxyFallback:      true,
 		PushPayloadObfuscationKey:     obfuscationKey,
 		PushPayloadSignaturePublicKey: publicKey,
 	}
@@ -635,10 +725,41 @@ func TestControllerImportPushPayloadLightProxy(t *testing.T) {
 
 		t.Fatal("unexpected stored light proxy")
 	}
+	if storedLightProxy.Expires.IsZero() ||
+		!storedLightProxy.Expires.After(time.Now().UTC()) {
+		t.Fatal("unexpected stored light proxy expiry")
+	}
 
-	lightProxyClient, _ := controller.lightProxyClient.Load().(*light.Client)
+	lightProxyClient := controller.config.GetLightProxyClient()
 	if lightProxyClient == nil {
 		t.Fatal("missing initialized light proxy client")
+	}
+
+	expiredLightProxy, err := json.Marshal(
+		&StoredLightProxy{
+			LightProxyEntry:        storedLightProxy.LightProxyEntry,
+			LightProxyEntryTracker: storedLightProxy.LightProxyEntryTracker,
+			Expires:                time.Now().UTC().Add(-1 * time.Second),
+		})
+	if err != nil {
+		t.Fatal(errors.Trace(err))
+	}
+	err = SetKeyValue(datastoreStoredLightProxyKey, string(expiredLightProxy))
+	if err != nil {
+		t.Fatal(errors.Trace(err))
+	}
+
+	lightProxy := LoadLightProxy()
+	if lightProxy != nil {
+		t.Fatal("expired light proxy loaded")
+	}
+
+	lightProxyValue, err := GetKeyValue(datastoreStoredLightProxyKey)
+	if err != nil {
+		t.Fatal(errors.Trace(err))
+	}
+	if lightProxyValue != "" {
+		t.Fatal("expired light proxy not deleted")
 	}
 }
 
@@ -657,7 +778,18 @@ func TestControllerImportPushPayloadLightProxyStoreFailure(t *testing.T) {
 		"",
 		"example.org",
 		"",
+		0.0,
+		"",
+		0.0,
+		0,
+		0,
+		0,
+		0,
+		0,
 		[]string{"example.com:443"},
+		nil,
+		nil,
+		nil,
 		"example.com:443")
 	if err != nil {
 		t.Fatal(errors.Trace(err))
@@ -673,7 +805,7 @@ func TestControllerImportPushPayloadLightProxyStoreFailure(t *testing.T) {
 		PropagationChannelId:          "0000000000000000",
 		SponsorId:                     "0000000000000000",
 		DisableLocalSocksProxy:        true,
-		EnableLightProxy:              true,
+		EnableLightProxyFallback:      true,
 		PushPayloadObfuscationKey:     obfuscationKey,
 		PushPayloadSignaturePublicKey: publicKey,
 	}
@@ -731,7 +863,7 @@ func TestControllerImportPushPayloadLightProxyStoreFailure(t *testing.T) {
 		t.Fatal("push payload import succeeded despite light proxy store failure")
 	}
 
-	lightProxyClient, _ := controller.lightProxyClient.Load().(*light.Client)
+	lightProxyClient := controller.config.GetLightProxyClient()
 	if lightProxyClient != nil {
 		t.Fatal("light proxy client was initialized despite store failure")
 	}
@@ -755,7 +887,7 @@ func TestControllerImportPushPayloadInvalidLightProxyNotStored(t *testing.T) {
 		PropagationChannelId:          "0000000000000000",
 		SponsorId:                     "0000000000000000",
 		DisableLocalSocksProxy:        true,
-		EnableLightProxy:              true,
+		EnableLightProxyFallback:      true,
 		PushPayloadObfuscationKey:     obfuscationKey,
 		PushPayloadSignaturePublicKey: publicKey,
 	}
@@ -809,7 +941,7 @@ func TestControllerImportPushPayloadInvalidLightProxyNotStored(t *testing.T) {
 		t.Fatal("invalid light proxy was stored")
 	}
 
-	lightProxyClient, _ := controller.lightProxyClient.Load().(*light.Client)
+	lightProxyClient := controller.config.GetLightProxyClient()
 	if lightProxyClient != nil {
 		t.Fatal("invalid light proxy client was initialized")
 	}
