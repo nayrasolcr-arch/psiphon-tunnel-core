@@ -1,627 +1,675 @@
 package psiphon
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
-	"sort"
-	"strings"
-	"sync"
-	"time"
+        "crypto/sha256"
+        "encoding/hex"
+        "encoding/json"
+        "sort"
+        "strings"
+        "sync"
+        "time"
 
-	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
-	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
-	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
-	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
-	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
+        "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
+        "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
+        "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
+        "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
+        "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
 )
 
 const (
-	frontedMeekCDNScanCacheKeyPrefix     = "frontedMeekCDNScanCache"
-	frontedMeekCDNScanOverrideID         = "cdn-scan"
-	frontedMeekCDNScanSuccessTTL         = 7 * 24 * time.Hour
-	frontedMeekCDNScanFailureCooldown    = 2 * time.Hour
-	frontedMeekCDNScanProgressInterval   = 50
-	frontedMeekCDNScanAggressiveFanout   = 8
-	frontedMeekCDNScanConservativeFanout = 1
-	frontedMeekCDNScanMaxCandidateCount  = int(1<<31 - 1)
+        frontedMeekCDNScanCacheKeyPrefix     = "frontedMeekCDNScanCache"
+        frontedMeekCDNScanOverrideID         = "cdn-scan"
+        frontedMeekCDNScanSuccessTTL         = 7 * 24 * time.Hour
+        frontedMeekCDNScanFailureCooldown    = 2 * time.Hour
+        frontedMeekCDNScanProgressInterval   = 50
+        frontedMeekCDNScanAggressiveFanout   = 8
+        frontedMeekCDNScanConservativeFanout = 1
+        frontedMeekCDNScanMaxCandidateCount  = int(1<<31 - 1)
 )
 
 type frontedMeekCDNScanCandidateSet struct {
-	name string
-	spec parameters.FrontedMeekCDNScanSpec
+        name string
+        spec parameters.FrontedMeekCDNScanSpec
 }
 
 type frontedMeekCDNScanCacheEntry struct {
-	IPAddress            string
-	SNIServerName        string
-	LastSuccessTimestamp time.Time `json:",omitempty"`
-	LastFailureTimestamp time.Time `json:",omitempty"`
-	SuccessCount         int       `json:",omitempty"`
-	FailureCount         int       `json:",omitempty"`
+        IPAddress            string
+        SNIServerName        string
+        LastSuccessTimestamp time.Time `json:",omitempty"`
+        LastFailureTimestamp time.Time `json:",omitempty"`
+        SuccessCount         int       `json:",omitempty"`
+        FailureCount         int       `json:",omitempty"`
+        // Measured real-tunnel establishment time through this candidate in
+        // milliseconds (full ConnectTunnel: meek dial + TLS to the CDN edge +
+        // OSSH handshake). Candidates are not equally fast: some CDN edges
+        // pass the handshake quickly but then relay bytes slowly. Ranking by
+        // measured establishment speed (best + last observed) makes the
+        // preferred list order fast edges first instead of merely recent
+        // edges, which measurably reduces reconnect and first-page latency.
+        LastConnectDurationMs int64 `json:",omitempty"`
+        BestConnectDurationMs int64 `json:",omitempty"`
 }
 
 type frontedMeekCDNScanCacheRecord struct {
-	Entries     map[string]*frontedMeekCDNScanCacheEntry
-	ShuffleSeed string `json:",omitempty"`
+        Entries     map[string]*frontedMeekCDNScanCacheEntry
+        ShuffleSeed string `json:",omitempty"`
 }
 
 type frontedMeekCDNScanState struct {
-	mutex               sync.Mutex
-	datastoreKey        string
-	loaded              bool
-	entries             map[string]*frontedMeekCDNScanCacheEntry
-	shuffleSeed         string
-	attempts            int
-	lastProgressAttempt int
-	exhaustedLogged     bool
+        mutex               sync.Mutex
+        datastoreKey        string
+        loaded              bool
+        entries             map[string]*frontedMeekCDNScanCacheEntry
+        shuffleSeed         string
+        attempts            int
+        lastProgressAttempt int
+        exhaustedLogged     bool
 }
 
 var frontedMeekCDNScanStates sync.Map
 
 func noticeFrontedMeekCDNScanActive(
-	p parameters.ParametersAccessor,
-	networkID string,
-	workerPoolSize int,
-	aggressive bool) {
+        p parameters.ParametersAccessor,
+        networkID string,
+        workerPoolSize int,
+        aggressive bool) {
 
-	candidateSets := makeFrontedMeekCDNScanCandidateSets(p)
-	if frontedMeekCDNScanCandidateSetCount(candidateSets) == 0 {
-		return
-	}
-	getFrontedMeekCDNScanState(networkID, candidateSets).resetEstablishment()
+        candidateSets := makeFrontedMeekCDNScanCandidateSets(p)
+        if frontedMeekCDNScanCandidateSetCount(candidateSets) == 0 {
+                return
+        }
+        getFrontedMeekCDNScanState(networkID, candidateSets).resetEstablishment()
 
-	mode := "normal"
-	if aggressive {
-		mode = "beast"
-	}
+        mode := "normal"
+        if aggressive {
+                mode = "beast"
+        }
 
-	NoticeInfo(
-		"cdn fronting scan active (mode: %s, workers: %d)",
-		mode,
-		workerPoolSize)
+        NoticeInfo(
+                "cdn fronting scan active (mode: %s, workers: %d)",
+                mode,
+                workerPoolSize)
 }
 
 func frontedMeekCDNScanCandidateFanout(
-	p parameters.ParametersAccessor,
-	aggressive bool) int {
+        p parameters.ParametersAccessor,
+        aggressive bool) int {
 
-	candidateCount := frontedMeekCDNScanCandidateSetCount(
-		makeFrontedMeekCDNScanCandidateSets(p))
-	if candidateCount == 0 {
-		return 1
-	}
-	if !aggressive {
-		return frontedMeekCDNScanConservativeFanout
-	}
-	if candidateCount < frontedMeekCDNScanAggressiveFanout {
-		return candidateCount
-	}
-	return frontedMeekCDNScanAggressiveFanout
+        candidateCount := frontedMeekCDNScanCandidateSetCount(
+                makeFrontedMeekCDNScanCandidateSets(p))
+        if candidateCount == 0 {
+                return 1
+        }
+        if !aggressive {
+                return frontedMeekCDNScanConservativeFanout
+        }
+        if candidateCount < frontedMeekCDNScanAggressiveFanout {
+                return candidateCount
+        }
+        return frontedMeekCDNScanAggressiveFanout
 }
 
 func selectFrontedMeekCDNScanOverride(
-	p parameters.ParametersAccessor,
-	networkID string,
-	frontingProviderID string,
-	dialAddresses []string,
-	hostHeader string,
-	candidateNumber int) (
-	*parameters.FrontedMeekDialOverrideParameters,
-	*parameters.FrontedMeekCDNScanCandidate,
-	string,
-	bool,
-	error) {
+        p parameters.ParametersAccessor,
+        networkID string,
+        frontingProviderID string,
+        dialAddresses []string,
+        hostHeader string,
+        candidateNumber int) (
+        *parameters.FrontedMeekDialOverrideParameters,
+        *parameters.FrontedMeekCDNScanCandidate,
+        string,
+        bool,
+        error) {
 
-	userCandidateSets := makeFrontedMeekCDNScanUserCandidateSets(p)
-	builtInCandidateSets := makeFrontedMeekCDNScanBuiltInCandidateSets(p)
-	candidateSets := append(
-		append([]frontedMeekCDNScanCandidateSet{}, userCandidateSets...),
-		builtInCandidateSets...)
+        userCandidateSets := makeFrontedMeekCDNScanUserCandidateSets(p)
+        builtInCandidateSets := makeFrontedMeekCDNScanBuiltInCandidateSets(p)
+        candidateSets := append(
+                append([]frontedMeekCDNScanCandidateSet{}, userCandidateSets...),
+                builtInCandidateSets...)
 
-	scanCandidateCount := frontedMeekCDNScanCandidateSetCount(candidateSets)
-	userCandidateCount := frontedMeekCDNScanCandidateSetCount(userCandidateSets)
-	builtInCandidateCount := frontedMeekCDNScanCandidateSetCount(builtInCandidateSets)
+        scanCandidateCount := frontedMeekCDNScanCandidateSetCount(candidateSets)
+        userCandidateCount := frontedMeekCDNScanCandidateSetCount(userCandidateSets)
+        builtInCandidateCount := frontedMeekCDNScanCandidateSetCount(builtInCandidateSets)
 
-	overrides := p.FrontedMeekDialOverrides(parameters.FrontedMeekDialOverrides)
-	overrideCandidateCount, err := overrides.CandidateCount(
-		frontingProviderID,
-		dialAddresses,
-		hostHeader)
-	if err != nil {
-		return nil, nil, "", false, errors.Trace(err)
-	}
+        overrides := p.FrontedMeekDialOverrides(parameters.FrontedMeekDialOverrides)
+        overrideCandidateCount, err := overrides.CandidateCount(
+                frontingProviderID,
+                dialAddresses,
+                hostHeader)
+        if err != nil {
+                return nil, nil, "", false, errors.Trace(err)
+        }
 
-	candidateCount := frontedMeekCDNScanSaturatedAdd(
-		scanCandidateCount,
-		overrideCandidateCount)
-	if candidateCount == 0 {
-		return nil, nil, "", false, nil
-	}
-	if scanCandidateCount == 0 {
-		override, ok, err := overrides.SelectCandidateParameters(
-			frontingProviderID,
-			dialAddresses,
-			hostHeader,
-			candidateNumber)
-		return override, nil, "", ok, errors.Trace(err)
-	}
+        candidateCount := frontedMeekCDNScanSaturatedAdd(
+                scanCandidateCount,
+                overrideCandidateCount)
+        if candidateCount == 0 {
+                return nil, nil, "", false, nil
+        }
+        if scanCandidateCount == 0 {
+                override, ok, err := overrides.SelectCandidateParameters(
+                        frontingProviderID,
+                        dialAddresses,
+                        hostHeader,
+                        candidateNumber)
+                return override, nil, "", ok, errors.Trace(err)
+        }
 
-	state := getFrontedMeekCDNScanState(networkID, candidateSets)
-	preferredCandidates, skippedCandidates, shuffleKey := state.candidateHints()
-	if candidateNumber >= len(preferredCandidates)+candidateCount {
-		state.recordExhausted()
-		return nil, nil, "", false, nil
-	}
+        state := getFrontedMeekCDNScanState(networkID, candidateSets)
+        preferredCandidates, skippedCandidates, shuffleKey := state.candidateHints()
+        if candidateNumber >= len(preferredCandidates)+candidateCount {
+                state.recordExhausted()
+                return nil, nil, "", false, nil
+        }
 
-	var candidate *parameters.FrontedMeekCDNScanCandidate
-	if candidateNumber < len(preferredCandidates) {
-		selected := preferredCandidates[candidateNumber]
-		candidate = &selected
-	} else {
-		sourceCandidateNumber := candidateNumber - len(preferredCandidates)
-		if sourceCandidateNumber < userCandidateCount {
-			var ok bool
-			candidate, ok, err = selectFrontedMeekCDNScanCandidate(
-				userCandidateSets,
-				sourceCandidateNumber,
-				skippedCandidates,
-				shuffleKey)
-			if err != nil {
-				return nil, nil, "", false, errors.Trace(err)
-			}
-			if !ok {
-				return nil, nil, "", false, nil
-			}
-		} else {
-			sourceCandidateNumber -= userCandidateCount
-			if sourceCandidateNumber < overrideCandidateCount {
-				override, ok, err := overrides.SelectCandidateParametersNoWrap(
-					frontingProviderID,
-					dialAddresses,
-					hostHeader,
-					sourceCandidateNumber)
-				if err != nil {
-					return nil, nil, "", false, errors.Trace(err)
-				}
-				return override, nil, "", ok, nil
-			}
+        var candidate *parameters.FrontedMeekCDNScanCandidate
+        if candidateNumber < len(preferredCandidates) {
+                selected := preferredCandidates[candidateNumber]
+                candidate = &selected
+        } else {
+                sourceCandidateNumber := candidateNumber - len(preferredCandidates)
+                if sourceCandidateNumber < userCandidateCount {
+                        var ok bool
+                        candidate, ok, err = selectFrontedMeekCDNScanCandidate(
+                                userCandidateSets,
+                                sourceCandidateNumber,
+                                skippedCandidates,
+                                shuffleKey)
+                        if err != nil {
+                                return nil, nil, "", false, errors.Trace(err)
+                        }
+                        if !ok {
+                                return nil, nil, "", false, nil
+                        }
+                } else {
+                        sourceCandidateNumber -= userCandidateCount
+                        if sourceCandidateNumber < overrideCandidateCount {
+                                override, ok, err := overrides.SelectCandidateParametersNoWrap(
+                                        frontingProviderID,
+                                        dialAddresses,
+                                        hostHeader,
+                                        sourceCandidateNumber)
+                                if err != nil {
+                                        return nil, nil, "", false, errors.Trace(err)
+                                }
+                                return override, nil, "", ok, nil
+                        }
 
-			sourceCandidateNumber -= overrideCandidateCount
-			if sourceCandidateNumber >= builtInCandidateCount {
-				return nil, nil, "", false, nil
-			}
+                        sourceCandidateNumber -= overrideCandidateCount
+                        if sourceCandidateNumber >= builtInCandidateCount {
+                                return nil, nil, "", false, nil
+                        }
 
-			var ok bool
-			candidate, ok, err = selectFrontedMeekCDNScanCandidate(
-				builtInCandidateSets,
-				sourceCandidateNumber,
-				skippedCandidates,
-				shuffleKey)
-			if err != nil {
-				return nil, nil, "", false, errors.Trace(err)
-			}
-			if !ok {
-				return nil, nil, "", false, nil
-			}
-		}
-	}
+                        var ok bool
+                        candidate, ok, err = selectFrontedMeekCDNScanCandidate(
+                                builtInCandidateSets,
+                                sourceCandidateNumber,
+                                skippedCandidates,
+                                shuffleKey)
+                        if err != nil {
+                                return nil, nil, "", false, errors.Trace(err)
+                        }
+                        if !ok {
+                                return nil, nil, "", false, nil
+                        }
+                }
+        }
 
-	state.recordAttempt()
+        state.recordAttempt()
 
-	return &parameters.FrontedMeekDialOverrideParameters{
-			OverrideID:        frontedMeekCDNScanOverrideID,
-			DialAddress:       candidate.IPAddress,
-			SNIServerName:     candidate.SNIServerName,
-			VerifyServerNames: makeFrontedMeekCDNScanVerifyServerNames(*candidate),
-			ALPNProtocols:     []string{"http/1.1"},
-			TLSProfile:        "Chrome-83",
-		},
-		candidate,
-		state.datastoreKey,
-		true,
-		nil
+        return &parameters.FrontedMeekDialOverrideParameters{
+                        OverrideID:        frontedMeekCDNScanOverrideID,
+                        DialAddress:       candidate.IPAddress,
+                        SNIServerName:     candidate.SNIServerName,
+                        VerifyServerNames: makeFrontedMeekCDNScanVerifyServerNames(*candidate),
+                        ALPNProtocols:     []string{"http/1.1"},
+                        TLSProfile:        "Chrome-83",
+                },
+                candidate,
+                state.datastoreKey,
+                true,
+                nil
 }
 
-func recordFrontedMeekCDNScanResult(dialParams *DialParameters, success bool) {
-	if dialParams == nil ||
-		!dialParams.FrontedMeekCDNScanCandidate ||
-		dialParams.frontedMeekCDNScanStateKey == "" {
-		return
-	}
+func recordFrontedMeekCDNScanResult(
+        dialParams *DialParameters,
+        success bool,
+        connectDurationMs int64) {
+        if dialParams == nil ||
+                !dialParams.FrontedMeekCDNScanCandidate ||
+                dialParams.frontedMeekCDNScanStateKey == "" {
+                return
+        }
 
-	value, ok := frontedMeekCDNScanStates.Load(dialParams.frontedMeekCDNScanStateKey)
-	if !ok {
-		return
-	}
-	state := value.(*frontedMeekCDNScanState)
-	state.recordResult(dialParams.frontedMeekCDNScanSelectedCandidate, success)
+        value, ok := frontedMeekCDNScanStates.Load(dialParams.frontedMeekCDNScanStateKey)
+        if !ok {
+                return
+        }
+        state := value.(*frontedMeekCDNScanState)
+        state.recordResult(
+                dialParams.frontedMeekCDNScanSelectedCandidate,
+                success,
+                connectDurationMs)
 }
 
 func isFrontedMeekCDNScanDialParams(dialParams *DialParameters) bool {
-	return dialParams != nil &&
-		(dialParams.FrontedMeekCDNScanCandidate ||
-			dialParams.MeekFrontingDialOverrideID == frontedMeekCDNScanOverrideID)
+        return dialParams != nil &&
+                (dialParams.FrontedMeekCDNScanCandidate ||
+                        dialParams.MeekFrontingDialOverrideID == frontedMeekCDNScanOverrideID)
 }
 
 func frontedMeekCDNScanCandidateFromDialParams(
-	dialParams *DialParameters) parameters.FrontedMeekCDNScanCandidate {
+        dialParams *DialParameters) parameters.FrontedMeekCDNScanCandidate {
 
-	if dialParams == nil {
-		return parameters.FrontedMeekCDNScanCandidate{}
-	}
-	candidate := parameters.FrontedMeekCDNScanCandidate{
-		IPAddress:     dialParams.MeekFrontingDialAddress,
-		SNIServerName: dialParams.MeekSNIServerName,
-	}
-	if candidate.IPAddress == "" && dialParams.FrontedMeekCDNScanCandidate {
-		return dialParams.frontedMeekCDNScanSelectedCandidate
-	}
-	return candidate
+        if dialParams == nil {
+                return parameters.FrontedMeekCDNScanCandidate{}
+        }
+        candidate := parameters.FrontedMeekCDNScanCandidate{
+                IPAddress:     dialParams.MeekFrontingDialAddress,
+                SNIServerName: dialParams.MeekSNIServerName,
+        }
+        if candidate.IPAddress == "" && dialParams.FrontedMeekCDNScanCandidate {
+                return dialParams.frontedMeekCDNScanSelectedCandidate
+        }
+        return candidate
 }
 
 func noticeFrontedMeekCDNScanConnected(dialParams *DialParameters) {
 
-	if dialParams == nil ||
-		(!isFrontedMeekCDNScanDialParams(dialParams) &&
-			!protocol.TunnelProtocolUsesFrontedMeekCDN(dialParams.TunnelProtocol)) {
-		return
-	}
-	noticeFrontedMeekCDNScanFound(
-		frontedMeekCDNScanCandidateFromDialParams(dialParams))
+        if dialParams == nil ||
+                (!isFrontedMeekCDNScanDialParams(dialParams) &&
+                        !protocol.TunnelProtocolUsesFrontedMeekCDN(dialParams.TunnelProtocol)) {
+                return
+        }
+        noticeFrontedMeekCDNScanFound(
+                frontedMeekCDNScanCandidateFromDialParams(dialParams))
 }
 
 func makeFrontedMeekCDNScanCandidateSets(
-	p parameters.ParametersAccessor) []frontedMeekCDNScanCandidateSet {
+        p parameters.ParametersAccessor) []frontedMeekCDNScanCandidateSet {
 
-	candidateSets := makeFrontedMeekCDNScanUserCandidateSets(p)
-	candidateSets = append(candidateSets, makeFrontedMeekCDNScanBuiltInCandidateSets(p)...)
+        candidateSets := makeFrontedMeekCDNScanUserCandidateSets(p)
+        candidateSets = append(candidateSets, makeFrontedMeekCDNScanBuiltInCandidateSets(p)...)
 
-	return candidateSets
+        return candidateSets
 }
 
 func makeFrontedMeekCDNScanUserCandidateSets(
-	p parameters.ParametersAccessor) []frontedMeekCDNScanCandidateSet {
+        p parameters.ParametersAccessor) []frontedMeekCDNScanCandidateSet {
 
-	candidateSets := make([]frontedMeekCDNScanCandidateSet, 0, 1)
-	userSpec := p.FrontedMeekCDNScanSpec(parameters.FrontedMeekCDNScanSpecParameter)
-	if userSpec.CandidateCount() > 0 {
-		candidateSets = append(candidateSets, frontedMeekCDNScanCandidateSet{
-			name: "user",
-			spec: userSpec,
-		})
-	}
+        candidateSets := make([]frontedMeekCDNScanCandidateSet, 0, 1)
+        userSpec := p.FrontedMeekCDNScanSpec(parameters.FrontedMeekCDNScanSpecParameter)
+        if userSpec.CandidateCount() > 0 {
+                candidateSets = append(candidateSets, frontedMeekCDNScanCandidateSet{
+                        name: "user",
+                        spec: userSpec,
+                })
+        }
 
-	return candidateSets
+        return candidateSets
 }
 
 func makeFrontedMeekCDNScanBuiltInCandidateSets(
-	p parameters.ParametersAccessor) []frontedMeekCDNScanCandidateSet {
+        p parameters.ParametersAccessor) []frontedMeekCDNScanCandidateSet {
 
-	if !p.Bool(parameters.FrontedMeekCDNScanUseBuiltInSpec) {
-		return nil
-	}
-	return frontedMeekCDNScanBuiltInCandidateSets
+        if !p.Bool(parameters.FrontedMeekCDNScanUseBuiltInSpec) {
+                return nil
+        }
+        return frontedMeekCDNScanBuiltInCandidateSets
 }
 
 func frontedMeekCDNScanCandidateSetCount(
-	candidateSets []frontedMeekCDNScanCandidateSet) int {
+        candidateSets []frontedMeekCDNScanCandidateSet) int {
 
-	total := 0
-	for _, candidateSet := range candidateSets {
-		count := candidateSet.spec.CandidateCount()
-		if count <= 0 {
-			continue
-		}
-		if total > frontedMeekCDNScanMaxCandidateCount-count {
-			return frontedMeekCDNScanMaxCandidateCount
-		}
-		total += count
-	}
-	return total
+        total := 0
+        for _, candidateSet := range candidateSets {
+                count := candidateSet.spec.CandidateCount()
+                if count <= 0 {
+                        continue
+                }
+                if total > frontedMeekCDNScanMaxCandidateCount-count {
+                        return frontedMeekCDNScanMaxCandidateCount
+                }
+                total += count
+        }
+        return total
 }
 
 func frontedMeekCDNScanSaturatedAdd(a, b int) int {
-	if a > frontedMeekCDNScanMaxCandidateCount-b {
-		return frontedMeekCDNScanMaxCandidateCount
-	}
-	return a + b
+        if a > frontedMeekCDNScanMaxCandidateCount-b {
+                return frontedMeekCDNScanMaxCandidateCount
+        }
+        return a + b
 }
 
 func frontedMeekCDNScanCandidateSetsCacheKey(
-	candidateSets []frontedMeekCDNScanCandidateSet) string {
+        candidateSets []frontedMeekCDNScanCandidateSet) string {
 
-	hash := sha256.New()
-	for _, candidateSet := range candidateSets {
-		if candidateSet.spec.CandidateCount() == 0 {
-			continue
-		}
-		hash.Write([]byte(candidateSet.name))
-		hash.Write([]byte{0})
-		hash.Write([]byte(candidateSet.spec.CacheKey()))
-		hash.Write([]byte{0})
-	}
-	return hex.EncodeToString(hash.Sum(nil))
+        hash := sha256.New()
+        for _, candidateSet := range candidateSets {
+                if candidateSet.spec.CandidateCount() == 0 {
+                        continue
+                }
+                hash.Write([]byte(candidateSet.name))
+                hash.Write([]byte{0})
+                hash.Write([]byte(candidateSet.spec.CacheKey()))
+                hash.Write([]byte{0})
+        }
+        return hex.EncodeToString(hash.Sum(nil))
 }
 
 func selectFrontedMeekCDNScanCandidate(
-	candidateSets []frontedMeekCDNScanCandidateSet,
-	candidateNumber int,
-	skippedCandidates map[string]struct{},
-	shuffleKey string) (*parameters.FrontedMeekCDNScanCandidate, bool, error) {
+        candidateSets []frontedMeekCDNScanCandidateSet,
+        candidateNumber int,
+        skippedCandidates map[string]struct{},
+        shuffleKey string) (*parameters.FrontedMeekCDNScanCandidate, bool, error) {
 
-	if candidateNumber < 0 {
-		candidateNumber = 0
-	}
+        if candidateNumber < 0 {
+                candidateNumber = 0
+        }
 
-	for _, candidateSet := range candidateSets {
-		count := candidateSet.spec.CandidateCount()
-		if count <= 0 {
-			continue
-		}
-		if candidateNumber >= count {
-			candidateNumber -= count
-			continue
-		}
-		candidate, ok, err := candidateSet.spec.SelectCandidateWithShuffleKey(
-			candidateNumber,
-			skippedCandidates,
-			shuffleKey)
-		return candidate, ok, errors.Trace(err)
-	}
+        for _, candidateSet := range candidateSets {
+                count := candidateSet.spec.CandidateCount()
+                if count <= 0 {
+                        continue
+                }
+                if candidateNumber >= count {
+                        candidateNumber -= count
+                        continue
+                }
+                candidate, ok, err := candidateSet.spec.SelectCandidateWithShuffleKey(
+                        candidateNumber,
+                        skippedCandidates,
+                        shuffleKey)
+                return candidate, ok, errors.Trace(err)
+        }
 
-	return nil, false, nil
+        return nil, false, nil
 }
 
 func getFrontedMeekCDNScanState(
-	networkID string,
-	candidateSets []frontedMeekCDNScanCandidateSet) *frontedMeekCDNScanState {
+        networkID string,
+        candidateSets []frontedMeekCDNScanCandidateSet) *frontedMeekCDNScanState {
 
-	datastoreKey := strings.Join([]string{
-		frontedMeekCDNScanCacheKeyPrefix,
-		networkID,
-		frontedMeekCDNScanCandidateSetsCacheKey(candidateSets),
-	}, ":")
+        datastoreKey := strings.Join([]string{
+                frontedMeekCDNScanCacheKeyPrefix,
+                networkID,
+                frontedMeekCDNScanCandidateSetsCacheKey(candidateSets),
+        }, ":")
 
-	value, _ := frontedMeekCDNScanStates.LoadOrStore(
-		datastoreKey,
-		&frontedMeekCDNScanState{
-			datastoreKey: datastoreKey,
-			entries:      make(map[string]*frontedMeekCDNScanCacheEntry),
-		})
-	state := value.(*frontedMeekCDNScanState)
-	state.load()
-	return state
+        value, _ := frontedMeekCDNScanStates.LoadOrStore(
+                datastoreKey,
+                &frontedMeekCDNScanState{
+                        datastoreKey: datastoreKey,
+                        entries:      make(map[string]*frontedMeekCDNScanCacheEntry),
+                })
+        state := value.(*frontedMeekCDNScanState)
+        state.load()
+        return state
 }
 
 func (state *frontedMeekCDNScanState) load() {
-	state.mutex.Lock()
-	defer state.mutex.Unlock()
+        state.mutex.Lock()
+        defer state.mutex.Unlock()
 
-	if state.loaded {
-		return
-	}
-	state.loaded = true
-	defer func() {
-		if state.shuffleSeed == "" {
-			state.shuffleSeed = prng.HexString(16)
-		}
-	}()
+        if state.loaded {
+                return
+        }
+        state.loaded = true
+        defer func() {
+                if state.shuffleSeed == "" {
+                        state.shuffleSeed = prng.HexString(16)
+                }
+        }()
 
-	jsonCache, err := GetKeyValue(state.datastoreKey)
-	if err != nil || jsonCache == "" {
-		return
-	}
+        jsonCache, err := GetKeyValue(state.datastoreKey)
+        if err != nil || jsonCache == "" {
+                return
+        }
 
-	var record frontedMeekCDNScanCacheRecord
-	err = json.Unmarshal([]byte(jsonCache), &record)
-	if err != nil || record.Entries == nil {
-		return
-	}
+        var record frontedMeekCDNScanCacheRecord
+        err = json.Unmarshal([]byte(jsonCache), &record)
+        if err != nil || record.Entries == nil {
+                return
+        }
 
-	state.entries = record.Entries
-	state.shuffleSeed = record.ShuffleSeed
+        state.entries = record.Entries
+        state.shuffleSeed = record.ShuffleSeed
 }
 
 func (state *frontedMeekCDNScanState) resetEstablishment() {
-	state.mutex.Lock()
-	defer state.mutex.Unlock()
+        state.mutex.Lock()
+        defer state.mutex.Unlock()
 
-	state.attempts = 0
-	state.lastProgressAttempt = 0
-	state.exhaustedLogged = false
+        state.attempts = 0
+        state.lastProgressAttempt = 0
+        state.exhaustedLogged = false
 }
 
 func (state *frontedMeekCDNScanState) candidateHints() (
-	[]parameters.FrontedMeekCDNScanCandidate,
-	map[string]struct{},
-	string) {
+        []parameters.FrontedMeekCDNScanCandidate,
+        map[string]struct{},
+        string) {
 
-	now := time.Now()
-	preferredCandidates := make([]*frontedMeekCDNScanCacheEntry, 0)
-	skippedCandidates := make(map[string]struct{})
+        now := time.Now()
+        preferredCandidates := make([]*frontedMeekCDNScanCacheEntry, 0)
+        skippedCandidates := make(map[string]struct{})
 
-	state.mutex.Lock()
-	defer state.mutex.Unlock()
-	shuffleKey := state.shuffleSeed
+        state.mutex.Lock()
+        defer state.mutex.Unlock()
+        shuffleKey := state.shuffleSeed
 
-	for key, entry := range state.entries {
-		failureIsCurrent := !entry.LastFailureTimestamp.IsZero() &&
-			entry.LastFailureTimestamp.After(entry.LastSuccessTimestamp)
-		if failureIsCurrent &&
-			now.Sub(entry.LastFailureTimestamp) < frontedMeekCDNScanFailureCooldown {
-			skippedCandidates[key] = struct{}{}
-			continue
-		}
-		if !entry.LastSuccessTimestamp.IsZero() &&
-			now.Sub(entry.LastSuccessTimestamp) < frontedMeekCDNScanSuccessTTL &&
-			!failureIsCurrent {
-			preferredCandidates = append(preferredCandidates, entry)
-		}
-	}
+        for key, entry := range state.entries {
+                failureIsCurrent := !entry.LastFailureTimestamp.IsZero() &&
+                        entry.LastFailureTimestamp.After(entry.LastSuccessTimestamp)
+                if failureIsCurrent &&
+                        now.Sub(entry.LastFailureTimestamp) < frontedMeekCDNScanFailureCooldown {
+                        skippedCandidates[key] = struct{}{}
+                        continue
+                }
+                if !entry.LastSuccessTimestamp.IsZero() &&
+                        now.Sub(entry.LastSuccessTimestamp) < frontedMeekCDNScanSuccessTTL &&
+                        !failureIsCurrent {
+                        preferredCandidates = append(preferredCandidates, entry)
+                }
+        }
 
-	sort.Slice(preferredCandidates, func(i, j int) bool {
-		if preferredCandidates[i].LastSuccessTimestamp.Equal(
-			preferredCandidates[j].LastSuccessTimestamp) {
-			return preferredCandidates[i].SuccessCount > preferredCandidates[j].SuccessCount
-		}
-		return preferredCandidates[i].LastSuccessTimestamp.After(
-			preferredCandidates[j].LastSuccessTimestamp)
-	})
+        // Rank by measured real-tunnel quality first (fastest established
+        // tunnels), then by recency, then by total successes. Entries with
+        // no measurement yet rank between proven-fast and proven-slow.
+        sort.Slice(preferredCandidates, func(i, j int) bool {
+                a, b := preferredCandidates[i], preferredCandidates[j]
+                qualityA, qualityB := connectQualityBucket(a), connectQualityBucket(b)
+                if qualityA != qualityB {
+                        return qualityA < qualityB
+                }
+                if a.LastSuccessTimestamp.Equal(b.LastSuccessTimestamp) {
+                        return a.SuccessCount > b.SuccessCount
+                }
+                return a.LastSuccessTimestamp.After(b.LastSuccessTimestamp)
+        })
 
-	candidates := make([]parameters.FrontedMeekCDNScanCandidate, 0, len(preferredCandidates))
-	for _, entry := range preferredCandidates {
-		candidates = append(candidates, parameters.FrontedMeekCDNScanCandidate{
-			IPAddress:     entry.IPAddress,
-			SNIServerName: entry.SNIServerName,
-		})
-	}
+        candidates := make([]parameters.FrontedMeekCDNScanCandidate, 0, len(preferredCandidates))
+        for _, entry := range preferredCandidates {
+                candidates = append(candidates, parameters.FrontedMeekCDNScanCandidate{
+                        IPAddress:     entry.IPAddress,
+                        SNIServerName: entry.SNIServerName,
+                })
+        }
 
-	return candidates, skippedCandidates, shuffleKey
+        return candidates, skippedCandidates, shuffleKey
 }
 
 func (state *frontedMeekCDNScanState) recordAttempt() {
 
-	state.mutex.Lock()
-	state.attempts += 1
-	attempts := state.attempts
-	shouldLog := attempts == 1 ||
-		attempts-state.lastProgressAttempt >= frontedMeekCDNScanProgressInterval
-	if shouldLog {
-		state.lastProgressAttempt = attempts
-	}
-	working := state.workingCountLocked()
-	state.mutex.Unlock()
+        state.mutex.Lock()
+        state.attempts += 1
+        attempts := state.attempts
+        shouldLog := attempts == 1 ||
+                attempts-state.lastProgressAttempt >= frontedMeekCDNScanProgressInterval
+        if shouldLog {
+                state.lastProgressAttempt = attempts
+        }
+        working := state.workingCountLocked()
+        state.mutex.Unlock()
 
-	if shouldLog {
-		NoticeInfo(
-			"cdn fronting scan progress (attempts: %d, working: %d)",
-			attempts,
-			working)
-	}
+        if shouldLog {
+                NoticeInfo(
+                        "cdn fronting scan progress (attempts: %d, working: %d)",
+                        attempts,
+                        working)
+        }
 }
 
 func (state *frontedMeekCDNScanState) recordExhausted() {
 
-	state.mutex.Lock()
-	if state.exhaustedLogged {
-		state.mutex.Unlock()
-		return
-	}
-	state.exhaustedLogged = true
-	attempts := state.attempts
-	working := state.workingCountLocked()
-	state.mutex.Unlock()
+        state.mutex.Lock()
+        if state.exhaustedLogged {
+                state.mutex.Unlock()
+                return
+        }
+        state.exhaustedLogged = true
+        attempts := state.attempts
+        working := state.workingCountLocked()
+        state.mutex.Unlock()
 
-	NoticeInfo(
-		"cdn fronting scan exhausted (attempts: %d, working: %d)",
-		attempts,
-		working)
+        NoticeInfo(
+                "cdn fronting scan exhausted (attempts: %d, working: %d)",
+                attempts,
+                working)
+}
+
+// connectQualityBucket groups candidates by their measured real-tunnel
+// establishment speed: 0 = fast (<2.5s), 1 = medium (<6s), 2 = slow (>=6s).
+// Unmeasured candidates (0 duration) rank as medium so that they are still
+// tried, but never displace proven-fast edges nor sit ahead of proven-slow
+// edges that at least once worked.
+func connectQualityBucket(entry *frontedMeekCDNScanCacheEntry) int {
+        duration := entry.BestConnectDurationMs
+        if duration <= 0 {
+                return 1
+        }
+        if duration < 2500 {
+                return 0
+        }
+        if duration < 6000 {
+                return 1
+        }
+        return 2
 }
 
 func (state *frontedMeekCDNScanState) recordResult(
-	candidate parameters.FrontedMeekCDNScanCandidate,
-	success bool) {
+        candidate parameters.FrontedMeekCDNScanCandidate,
+        success bool,
+        connectDurationMs int64) {
 
-	now := time.Now()
-	key := candidate.Key()
+        now := time.Now()
+        key := candidate.Key()
 
-	state.mutex.Lock()
-	entry := state.entries[key]
-	if entry == nil {
-		entry = &frontedMeekCDNScanCacheEntry{
-			IPAddress:     candidate.IPAddress,
-			SNIServerName: candidate.SNIServerName,
-		}
-		state.entries[key] = entry
-	}
+        state.mutex.Lock()
+        entry := state.entries[key]
+        if entry == nil {
+                entry = &frontedMeekCDNScanCacheEntry{
+                        IPAddress:     candidate.IPAddress,
+                        SNIServerName: candidate.SNIServerName,
+                }
+                state.entries[key] = entry
+        }
 
-	if success {
-		entry.LastSuccessTimestamp = now
-		entry.SuccessCount += 1
-	} else {
-		entry.LastFailureTimestamp = now
-		entry.FailureCount += 1
-	}
-	jsonCache := state.marshalLocked()
-	state.mutex.Unlock()
+        if success {
+                entry.LastSuccessTimestamp = now
+                entry.SuccessCount += 1
+                if connectDurationMs > 0 {
+                        entry.LastConnectDurationMs = connectDurationMs
+                        if entry.BestConnectDurationMs <= 0 ||
+                                connectDurationMs < entry.BestConnectDurationMs {
+                                entry.BestConnectDurationMs = connectDurationMs
+                        }
+                }
+        } else {
+                entry.LastFailureTimestamp = now
+                entry.FailureCount += 1
+        }
+        jsonCache := state.marshalLocked()
+        state.mutex.Unlock()
 
-	if jsonCache != nil {
-		_ = SetKeyValue(state.datastoreKey, string(jsonCache))
-	}
+        if jsonCache != nil {
+                _ = SetKeyValue(state.datastoreKey, string(jsonCache))
+        }
 }
 
 func noticeFrontedMeekCDNScanFound(candidate parameters.FrontedMeekCDNScanCandidate) {
 
-	if candidate.IPAddress == "" {
-		return
-	}
-	sniServerName := candidate.SNIServerName
-	if sniServerName == "" {
-		sniServerName = "none"
-	}
-	NoticeInfo(
-		"cdn fronting scan found (ip: %s, sni: %s)",
-		common.EscapeRedactIPAddressString(candidate.IPAddress),
-		sniServerName)
+        if candidate.IPAddress == "" {
+                return
+        }
+        sniServerName := candidate.SNIServerName
+        if sniServerName == "" {
+                sniServerName = "none"
+        }
+        NoticeInfo(
+                "cdn fronting scan found (ip: %s, sni: %s)",
+                common.EscapeRedactIPAddressString(candidate.IPAddress),
+                sniServerName)
 }
 
 func (state *frontedMeekCDNScanState) marshalLocked() []byte {
-	entries := make(map[string]*frontedMeekCDNScanCacheEntry, len(state.entries))
-	for key, entry := range state.entries {
-		copyEntry := *entry
-		entries[key] = &copyEntry
-	}
-	record := &frontedMeekCDNScanCacheRecord{
-		Entries:     entries,
-		ShuffleSeed: state.shuffleSeed,
-	}
-	jsonCache, err := json.Marshal(record)
-	if err != nil {
-		return nil
-	}
-	return jsonCache
+        entries := make(map[string]*frontedMeekCDNScanCacheEntry, len(state.entries))
+        for key, entry := range state.entries {
+                copyEntry := *entry
+                entries[key] = &copyEntry
+        }
+        record := &frontedMeekCDNScanCacheRecord{
+                Entries:     entries,
+                ShuffleSeed: state.shuffleSeed,
+        }
+        jsonCache, err := json.Marshal(record)
+        if err != nil {
+                return nil
+        }
+        return jsonCache
 }
 
 func (state *frontedMeekCDNScanState) workingCountLocked() int {
-	now := time.Now()
-	count := 0
-	for _, entry := range state.entries {
-		if !entry.LastSuccessTimestamp.IsZero() &&
-			now.Sub(entry.LastSuccessTimestamp) < frontedMeekCDNScanSuccessTTL &&
-			(entry.LastFailureTimestamp.IsZero() ||
-				entry.LastSuccessTimestamp.After(entry.LastFailureTimestamp)) {
-			count += 1
-		}
-	}
-	return count
+        now := time.Now()
+        count := 0
+        for _, entry := range state.entries {
+                if !entry.LastSuccessTimestamp.IsZero() &&
+                        now.Sub(entry.LastSuccessTimestamp) < frontedMeekCDNScanSuccessTTL &&
+                        (entry.LastFailureTimestamp.IsZero() ||
+                                entry.LastSuccessTimestamp.After(entry.LastFailureTimestamp)) {
+                        count += 1
+                }
+        }
+        return count
 }
 
 func makeFrontedMeekCDNScanVerifyServerNames(
-	candidate parameters.FrontedMeekCDNScanCandidate) []string {
+        candidate parameters.FrontedMeekCDNScanCandidate) []string {
 
-	verifyServerNames := make([]string, 0, 8)
-	seen := make(map[string]struct{})
+        verifyServerNames := make([]string, 0, 8)
+        seen := make(map[string]struct{})
 
-	add := func(value string) {
-		if value == "" {
-			return
-		}
-		if _, ok := seen[value]; ok {
-			return
-		}
-		seen[value] = struct{}{}
-		verifyServerNames = append(verifyServerNames, value)
-	}
+        add := func(value string) {
+                if value == "" {
+                        return
+                }
+                if _, ok := seen[value]; ok {
+                        return
+                }
+                seen[value] = struct{}{}
+                verifyServerNames = append(verifyServerNames, value)
+        }
 
-	add(candidate.SNIServerName)
-	add(candidate.IPAddress)
-	add("a248.e.akamai.net")
-	add("a.akamaized.net")
-	add("a.akamaized-staging.net")
-	add("a.akamaihd.net")
-	add("a.akamaihd-staging.net")
-	add("www.akamai.com")
+        add(candidate.SNIServerName)
+        add(candidate.IPAddress)
+        add("a248.e.akamai.net")
+        add("a.akamaized.net")
+        add("a.akamaized-staging.net")
+        add("a.akamaihd.net")
+        add("a.akamaihd-staging.net")
+        add("www.akamai.com")
 
-	return verifyServerNames
+        return verifyServerNames
 }

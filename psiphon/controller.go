@@ -4142,6 +4142,11 @@ loop:
 		// reclaim as much as possible.
 		DoGarbageCollection()
 
+		// Measure the real establishment time through this candidate. The
+		// duration (meek dial + TLS handshake with the CDN edge + OSSH tunnel
+		// handshake) is recorded on the scan cache entry on success and used
+		// to rank candidates by measured quality, not just recency.
+		connectStartTime := time.Now()
 		tunnel, err := ConnectTunnel(
 			controller.establishCtx,
 			controller.config,
@@ -4183,7 +4188,7 @@ loop:
 				break loop
 			}
 
-			recordFrontedMeekCDNScanResult(dialParams, false)
+			recordFrontedMeekCDNScanResult(dialParams, false, 0)
 
 			NoticeInfo("failed to connect to %s: %v",
 				candidateServerEntry.serverEntry.GetDiagnosticID(),
@@ -4195,7 +4200,10 @@ loop:
 		if isFrontedMeekCDNScanDialParams(dialParams) {
 			controller.markFrontedMeekCDNScanRouteFound()
 		}
-		recordFrontedMeekCDNScanResult(dialParams, true)
+		recordFrontedMeekCDNScanResult(
+			dialParams,
+			true,
+			time.Since(connectStartTime).Milliseconds())
 
 		// Deliver connected tunnel.
 		// Don't block. Assumes the receiver has a buffer large enough for
