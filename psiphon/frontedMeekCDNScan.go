@@ -22,7 +22,7 @@ const (
         frontedMeekCDNScanSuccessTTL         = 7 * 24 * time.Hour
         frontedMeekCDNScanFailureCooldown    = 2 * time.Hour
         frontedMeekCDNScanProgressInterval   = 50
-        frontedMeekCDNScanAggressiveFanout   = 8
+        frontedMeekCDNScanAggressiveFanout   = 16
         frontedMeekCDNScanConservativeFanout = 1
         frontedMeekCDNScanMaxCandidateCount  = int(1<<31 - 1)
 )

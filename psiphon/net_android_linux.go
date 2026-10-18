@@ -23,42 +23,49 @@
 package psiphon
 
 import (
-	"net"
-	"strconv"
-	"unsafe"
+        "net"
+        "strconv"
+        "unsafe"
 
-	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
-	"golang.org/x/net/bpf"
-	"golang.org/x/sys/unix"
+        "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
+        "golang.org/x/net/bpf"
+        "golang.org/x/sys/unix"
 )
 
 func ClientBPFEnabled() bool {
-	return true
+        return true
 }
 
 func setSocketBPF(BPFProgramInstructions []bpf.RawInstruction, socketFD int) error {
 
-	// Tactics parameters validation ensures BPFProgramInstructions has len >= 1.
-	err := unix.SetsockoptSockFprog(
-		socketFD,
-		unix.SOL_SOCKET,
-		unix.SO_ATTACH_FILTER,
-		&unix.SockFprog{
-			Len:    uint16(len(BPFProgramInstructions)),
-			Filter: (*unix.SockFilter)(unsafe.Pointer(&BPFProgramInstructions[0])),
-		})
-	return errors.Trace(err)
+        // Tactics parameters validation ensures BPFProgramInstructions has len >= 1.
+        err := unix.SetsockoptSockFprog(
+                socketFD,
+                unix.SOL_SOCKET,
+                unix.SO_ATTACH_FILTER,
+                &unix.SockFprog{
+                        Len:    uint16(len(BPFProgramInstructions)),
+                        Filter: (*unix.SockFilter)(unsafe.Pointer(&BPFProgramInstructions[0])),
+                })
+        return errors.Trace(err)
 }
 
-func setAdditionalSocketOptions(_ int) {
+func setAdditionalSocketOptions(socketFD int) {
+
+        // Optional, config-gated TCP performance tuning: BBR congestion
+        // control, enlarged socket buffers, keepalive tuning. All options are
+        // best-effort; dials proceed with kernel defaults on failure.
+        if tcpSpeedOptimizationsEnabled.Load() {
+                applyTCPSpeedOptimizations(socketFD)
+        }
 }
 
 func makeLocalProxyListener(listenIP string, port int) (net.Listener, bool, error) {
-	listener, err := net.Listen("tcp", net.JoinHostPort(listenIP, strconv.Itoa(port)))
-	if err != nil {
-		return nil, IsAddressInUseError(err), errors.Trace(err)
-	}
-	return listener, false, nil
+        listener, err := net.Listen("tcp", net.JoinHostPort(listenIP, strconv.Itoa(port)))
+        if err != nil {
+                return nil, IsAddressInUseError(err), errors.Trace(err)
+        }
+        return listener, false, nil
 }
 
 // IsUnixDomainSocketsSupported reports whether the local proxies can listen on
@@ -66,9 +73,9 @@ func makeLocalProxyListener(listenIP string, port int) (net.Listener, bool, erro
 // (paths with a leading "@") are supported. On Android and Linux, both are
 // supported.
 func IsUnixDomainSocketsSupported() (supported, abstractSupported bool) {
-	return true, true
+        return true, true
 }
 
 func makeLocalProxyUnixListener(path string) (net.Listener, error) {
-	return listenUnixProxySocket(path)
+        return listenUnixProxySocket(path)
 }
